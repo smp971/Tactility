@@ -7,6 +7,7 @@
 #include "tactility/drivers/gpio_descriptor.h"
 #include <tactility/drivers/esp32_gpio_helpers.h>
 #include <tactility/drivers/gpio_controller.h>
+#include <esp_idf_version.h>
 #include <cstring>
 #include <new>
 #include <soc/gpio_num.h>
@@ -112,7 +113,9 @@ static error_t start(Device* device) {
         .data7_io_num = GPIO_NUM_NC,
         .data_io_default_level = false,
         .max_transfer_sz = dts_config->max_transfer_size,
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
         .dma_burst_size = 0,
+#endif
         .flags = 0,
         .isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO,
         .intr_flags = 0

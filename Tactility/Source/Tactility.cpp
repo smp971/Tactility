@@ -181,6 +181,10 @@ namespace app {
     namespace usbsettings { extern const ::AppManifest manifest; }
     namespace btmanage { extern const ::AppManifest manifest; }
     namespace btpeersettings { extern const ::AppManifest manifest; }
+    namespace controlcenter { extern const ::AppManifest manifest; }
+    namespace gateway4g { extern const ::AppManifest manifest; }
+    namespace deskclock { extern const ::AppManifest manifest; }
+    namespace btremote { extern const ::AppManifest manifest; }
     namespace wifiapsettings { extern const ::AppManifest manifest; }
     namespace wificonnect { extern const ::AppManifest manifest; }
     namespace wifimanage { extern const ::AppManifest manifest; }
@@ -212,6 +216,10 @@ static void registerInternalApps() {
     LOG_I(TAG, "Registering internal apps");
 
     app_manager_add(&app::alertdialog::manifest);
+    app_manager_add(&app::controlcenter::manifest);
+    app_manager_add(&app::gateway4g::manifest);
+    app_manager_add(&app::deskclock::manifest);
+    app_manager_add(&app::btremote::manifest);
     app_manager_add(&app::apppackagedetails::manifest);
     app_manager_add(&app::apphub::manifest);
     app_manager_add(&app::apphubdetails::manifest);

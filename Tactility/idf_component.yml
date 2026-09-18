@@ -95,5 +95,6 @@ dependencies:
     version: "7.7.1"
     rules:
       - if: "target in [esp32, esp32s3, esp32p4]"
-  idf: '6.1.0'
+  # T-HMI Advanced is also built and verified against the user's ESP-IDF 6.0.1 toolchain.
+  idf: '>=6.0.1'
 

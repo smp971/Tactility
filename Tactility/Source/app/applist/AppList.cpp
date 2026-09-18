@@ -37,10 +37,35 @@ void onBackPressed(lv_event_t* event) {
     app_event_emit_close(ctx->appInstanceId);
 }
 
+const char* appIcon(const char* id) {
+    if (strstr(id, "chat")) return LVGL_ICON_SHARED_FORUM;
+    if (strstr(id, "deskclock") || strstr(id, "time")) return LVGL_ICON_SHARED_CALENDAR_MONTH;
+    if (strstr(id, "gateway")) return LVGL_ICON_SHARED_HUB;
+    if (strstr(id, "gps")) return LVGL_ICON_SHARED_NAVIGATION;
+    if (strstr(id, "i2c") || strstr(id, "grove")) return LVGL_ICON_SHARED_CABLE;
+    if (strstr(id, "wifi")) return LVGL_ICON_SHARED_WIFI;
+    if (strstr(id, "bt")) return LVGL_ICON_SHARED_BLUETOOTH;
+    if (strstr(id, "usb")) return LVGL_ICON_SHARED_USB;
+    if (strstr(id, "audio")) return LVGL_ICON_SHARED_MUSIC_NOTE;
+    if (strstr(id, "keyboard")) return LVGL_ICON_SHARED_KEYBOARD_ALT;
+    if (strstr(id, "display")) return LVGL_ICON_SHARED_DISPLAY_SETTINGS;
+    if (strstr(id, "power")) return LVGL_ICON_SHARED_POWER_SETTINGS_NEW;
+    if (strstr(id, "notes")) return LVGL_ICON_SHARED_EDIT_NOTE;
+    if (strstr(id, "image") || strstr(id, "screenshot")) return LVGL_ICON_SHARED_IMAGE;
+    if (strstr(id, "files") || strstr(id, "fileselection")) return LVGL_ICON_SHARED_FOLDER;
+    if (strstr(id, "webserver") || strstr(id, "locale")) return LVGL_ICON_SHARED_LANGUAGE;
+    if (strstr(id, "development")) return LVGL_ICON_SHARED_DEPLOYED_CODE;
+    if (strstr(id, "systeminfo")) return LVGL_ICON_SHARED_DEVICES;
+    if (strstr(id, "crash")) return LVGL_ICON_SHARED_HELP;
+    if (strstr(id, "apphub") || strstr(id, "package")) return LVGL_ICON_SHARED_DOWNLOAD;
+    if (strstr(id, "settings") || strstr(id, "setup")) return LVGL_ICON_SHARED_SETTINGS;
+    if (strstr(id, "trackball")) return LVGL_ICON_SHARED_GAMEPAD;
+    if (strstr(id, "touch")) return LVGL_ICON_SHARED_CIRCLE;
+    return LVGL_ICON_SHARED_TOOLBAR;
+}
+
 void createAppWidget(const ::AppManifest* manifest, lv_obj_t* list) {
-    // The new AppManifest has no per-app icon - use a shared generic one for every entry,
-    // same fallback the old model used for apps that didn't provide one.
-    lv_obj_t* btn = lv_list_add_button(list, LVGL_ICON_SHARED_TOOLBAR, manifest->name);
+    lv_obj_t* btn = lv_list_add_button(list, appIcon(manifest->id), manifest->name);
     lv_obj_t* image = lv_obj_get_child(btn, 0);
     lv_obj_set_style_text_font(image, lvgl_get_shared_icon_font(), LV_PART_MAIN);
     lv_obj_add_event_cb(btn, &onAppPressed, LV_EVENT_SHORT_CLICKED, const_cast<::AppManifest*>(manifest));

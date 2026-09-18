@@ -263,7 +263,9 @@ static error_t open(Device* device) {
         .stop_bits = to_esp32_stop_bits(driver_data->config.stop_bits),
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, // Flow control is not yet exposed via UartConfig
         .rx_flow_ctrl_thresh = 0,
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
         .rx_glitch_filt_thresh = 0,
+#endif
         .source_clk = UART_SCLK_DEFAULT,
         .flags = {
             .allow_pd = 0,
