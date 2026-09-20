@@ -10,6 +10,7 @@
 #include <tactility/memory.h>
 #include <tactility/time.h>
 #include <Tactility/Tactility.h>
+#include <Tactility/Thread.h>
 #include <Tactility/Timer.h>
 
 #ifdef ESP_PLATFORM
@@ -63,8 +64,10 @@ struct Context {
     lv_obj_t* metricLabels[3] {};
     lv_obj_t* footer = nullptr;
     Weather weather;
+    WindowId window = 0;
     std::unique_ptr<Timer> clockTimer;
     std::unique_ptr<Timer> weatherTimer;
+    std::unique_ptr<Thread> weatherWorker;
 };
 
 #ifdef ESP_PLATFORM
@@ -242,8 +245,24 @@ void refreshWeather(Context* ctx) {
     fetchWeather(next);
     lvgl_lock();
     ctx->weather = next;
-    renderWeather(ctx);
+    if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED) {
+        renderWeather(ctx);
+    }
     lvgl_unlock();
+}
+
+// The HTTP requests block for seconds, so they run on a worker thread rather than the timer task.
+void refreshWeatherAsync(Context* ctx) {
+    if (ctx->weatherWorker) {
+        if (ctx->weatherWorker->getState() != Thread::State::Stopped) return;
+        ctx->weatherWorker->join();
+        ctx->weatherWorker.reset();
+    }
+    ctx->weatherWorker = std::make_unique<Thread>("deskclock_weather", 6144, [ctx] {
+        refreshWeather(ctx);
+        return 0;
+    });
+    ctx->weatherWorker->start();
 }
 
 void onBack(lv_event_t* event) {
@@ -325,13 +344,16 @@ int32_t appMain(int, char**) {
     AppEventSubscription subscription {};
     check(app_event_subscribe(&subscription, &events) == ERROR_NONE);
     WindowId window = window_manager_create(ctx.appInstanceId, createWidgets, &ctx);
+    ctx.window = window;
     ctx.clockTimer = std::make_unique<Timer>(Timer::Type::Periodic, seconds_to_ticks(1), [&ctx] {
-        lvgl_lock(); updateClock(&ctx); lvgl_unlock();
+        lvgl_lock();
+        if (window_manager_get_state(ctx.window) == WINDOW_STATE_GRANTED) updateClock(&ctx);
+        lvgl_unlock();
     });
-    ctx.weatherTimer = std::make_unique<Timer>(Timer::Type::Periodic, seconds_to_ticks(900), [&ctx] { refreshWeather(&ctx); });
+    ctx.weatherTimer = std::make_unique<Timer>(Timer::Type::Periodic, seconds_to_ticks(900), [&ctx] { refreshWeatherAsync(&ctx); });
     ctx.clockTimer->start();
     ctx.weatherTimer->start();
-    refreshWeather(&ctx);
+    refreshWeatherAsync(&ctx);
     bool close = false;
     while (!close) {
         task_event_group_wait_any(&events, nullptr, portMAX_DELAY);
@@ -341,6 +363,10 @@ int32_t appMain(int, char**) {
     }
     ctx.clockTimer->stop();
     ctx.weatherTimer->stop();
+    if (ctx.weatherWorker) {
+        ctx.weatherWorker->join();
+        ctx.weatherWorker.reset();
+    }
     window_manager_remove(window);
     check(app_event_unsubscribe(&subscription) == ERROR_NONE);
     task_event_group_destruct(&events);

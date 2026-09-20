@@ -7,16 +7,12 @@ The T-HMI profile uses 120 MHz flash and PSRAM clocks with ESP-IDF 6.1 for maxim
 
 ## Included shortcuts
 
-- Wi-Fi management
-- Bluetooth management
-- SD-card file browser
-- Complete application list
+- Apps (complete application list)
+- Files (SD-card file browser)
 - Settings
-- System information
-- I2C scanner
-- USB settings, when the USB MSC service is available
 
-Unavailable services are automatically omitted instead of showing dead buttons.
+Other apps (Wi-Fi, Bluetooth, Bluetooth Remote, Desk Clock, 4G Gateway) are opened from Apps.
+Shortcuts whose app is not registered are automatically omitted instead of showing dead buttons.
 
 ## Build and flash
 

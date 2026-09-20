@@ -10,6 +10,7 @@
 #include <tactility/memory.h>
 #include <tactility/time.h>
 #include <Tactility/Tactility.h>
+#include <Tactility/Thread.h>
 #include <Tactility/Timer.h>
 
 #ifdef ESP_PLATFORM
@@ -21,7 +22,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace tt::app::gateway4g {
@@ -81,13 +84,60 @@ struct Context {
     std::string nodeId;
     std::string key;
     bool paired = false;
+    std::mutex credLock;
+    WindowId window = 0;
     std::unique_ptr<Timer> refreshTimer;
+    std::unique_ptr<Thread> refreshWorker;
+    std::unique_ptr<Thread> commandWorker;
 };
+
+struct Creds {
+    std::string nodeId;
+    std::string key;
+    bool paired;
+};
+
+Creds creds(Context* ctx) {
+    std::lock_guard lock(ctx->credLock);
+    return { ctx->nodeId, ctx->key, ctx->paired };
+}
 
 void setLabel(lv_obj_t* label, const char* text) {
     if (label != nullptr && lv_obj_is_valid(label)) {
         lv_label_set_text(label, text);
     }
+}
+
+// Network calls block for seconds, so they run on a worker thread instead of the LVGL or timer task.
+// Returns false when the previous job on this worker is still running.
+bool runAsync(std::unique_ptr<Thread>& worker, std::function<void()> job) {
+    if (worker) {
+        if (worker->getState() != Thread::State::Stopped) return false;
+        worker->join();
+        worker.reset();
+    }
+    worker = std::make_unique<Thread>("gw4g", 6144, [job = std::move(job)] {
+        job();
+        return 0;
+    });
+    worker->start();
+    return true;
+}
+
+void stopWorker(std::unique_ptr<Thread>& worker) {
+    if (worker) {
+        worker->join();
+        worker.reset();
+    }
+}
+
+// Must be called from a worker thread: takes the LVGL lock and skips widgets of a buried window.
+void postLabel(Context* ctx, lv_obj_t* label, const std::string& text) {
+    lvgl_lock();
+    if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED) {
+        setLabel(label, text.c_str());
+    }
+    lvgl_unlock();
 }
 
 #ifdef ESP_PLATFORM
@@ -156,11 +206,7 @@ void initIdentity(Context* ctx) {
 
 bool loadCredentials(Context* ctx) {
     nvs_handle_t handle;
-    if (nvs_open("gateway4g", NVS_READONLY, &handle) != ESP_OK) {
-        ctx->key = "REDACTED";
-        ctx->paired = true;
-        return true;
-    }
+    if (nvs_open("gateway4g", NVS_READONLY, &handle) != ESP_OK) return false;
     char key[65] {};
     size_t length = sizeof(key);
     const auto result = nvs_get_str(handle, "key", key, &length);
@@ -171,35 +217,39 @@ bool loadCredentials(Context* ctx) {
     return true;
 }
 
-void saveCredentials(const Context* ctx) {
+void saveCredentials(const std::string& key) {
     nvs_handle_t handle;
     if (nvs_open("gateway4g", NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_str(handle, "key", ctx->key.c_str());
+        nvs_set_str(handle, "key", key.c_str());
         nvs_commit(handle);
         nvs_close(handle);
     }
 }
 
-bool pairGateway(Context* ctx, const char* pairCode) {
-    if (pairCode == nullptr || std::strlen(pairCode) != 6) return false;
+bool pairGateway(Context* ctx, const std::string& pairCode) {
+    if (pairCode.size() != 6) return false;
 
     char claim[320];
     std::snprintf(claim, sizeof(claim),
         "{\"code\":\"%s\",\"id\":\"%s\",\"name\":\"Tactility T-HMI\",\"role\":\"console\",\"capabilities\":\"gateway,phone,sms,gnss\"}",
-        pairCode, ctx->nodeId.c_str());
+        pairCode.c_str(), ctx->nodeId.c_str());
     std::string claimResponse;
     if (!request("http://10.1.10.12/api/pairing/claim", HTTP_METHOD_POST, claim, {}, {}, claimResponse)) return false;
     auto* reply = cJSON_Parse(claimResponse.c_str());
     auto* key = reply ? cJSON_GetObjectItemCaseSensitive(reply, "key") : nullptr;
-    if (cJSON_IsString(key)) ctx->key = key->valuestring;
+    std::string newKey = cJSON_IsString(key) && key->valuestring ? key->valuestring : "";
     cJSON_Delete(reply);
-    ctx->paired = ctx->key.size() == 64;
-    if (ctx->paired) saveCredentials(ctx);
-    return ctx->paired;
+    if (newKey.size() != 64) return false;
+    saveCredentials(newKey);
+    std::lock_guard lock(ctx->credLock);
+    ctx->key = newKey;
+    ctx->paired = true;
+    return true;
 }
 
 bool sendCommand(Context* ctx, const char* command, const char* value = nullptr, const char* text = nullptr) {
-    if (!ctx->paired) return false;
+    const auto identity = creds(ctx);
+    if (!identity.paired) return false;
     cJSON* json = cJSON_CreateObject();
     cJSON_AddStringToObject(json, "command", command);
     if (value) cJSON_AddStringToObject(json, "value", value);
@@ -209,15 +259,16 @@ bool sendCommand(Context* ctx, const char* command, const char* value = nullptr,
     if (!encoded) return false;
     std::string response;
     const bool ok = request("http://10.1.10.12/api/node/control", HTTP_METHOD_POST,
-        encoded, ctx->nodeId, ctx->key, response, 30000);
+        encoded, identity.nodeId, identity.key, response, 30000);
     cJSON_free(encoded);
     return ok;
 }
 
 bool fetchGateway(Context* ctx, GatewayData& data) {
     std::string body;
-    const char* url = ctx->paired ? "http://10.1.10.12/api/node/gateway" : GATEWAY_URL;
-    if (!request(url, HTTP_METHOD_GET, nullptr, ctx->nodeId, ctx->key, body)) return false;
+    const auto identity = creds(ctx);
+    const char* url = identity.paired ? "http://10.1.10.12/api/node/gateway" : GATEWAY_URL;
+    if (!request(url, HTTP_METHOD_GET, nullptr, identity.nodeId, identity.key, body)) return false;
 
     auto* root = cJSON_Parse(body.c_str());
     if (root == nullptr) return false;
@@ -262,7 +313,7 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
 #else
 void initIdentity(Context*) {}
 bool loadCredentials(Context*) { return false; }
-bool pairGateway(Context*, const char*) { return false; }
+bool pairGateway(Context*, const std::string&) { return false; }
 bool sendCommand(Context*, const char*, const char* = nullptr, const char* = nullptr) { return false; }
 bool fetchGateway(Context*, GatewayData&) { return false; }
 #endif
@@ -328,8 +379,27 @@ void refresh(Context* ctx) {
     GatewayData data;
     fetchGateway(ctx, data);
     lvgl_lock();
-    render(ctx, data);
+    if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED) {
+        render(ctx, data);
+    }
     lvgl_unlock();
+}
+
+// Runs from the timer task: only queues the request, never blocks.
+void refreshAsync(Context* ctx) {
+    runAsync(ctx->refreshWorker, [ctx] { refresh(ctx); });
+}
+
+// Called from LVGL event handlers: copies the inputs, then sends the command off the LVGL thread.
+void command(Context* ctx, lv_obj_t* target, const char* name, const char* okText, const char* failText,
+             lv_obj_t* valueField = nullptr, lv_obj_t* textField = nullptr) {
+    const std::string value = valueField ? lv_textarea_get_text(valueField) : "";
+    const std::string text = textField ? lv_textarea_get_text(textField) : "";
+    const bool started = runAsync(ctx->commandWorker, [=] {
+        const bool ok = sendCommand(ctx, name, valueField ? value.c_str() : nullptr, textField ? text.c_str() : nullptr);
+        postLabel(ctx, target, ok ? okText : failText);
+    });
+    setLabel(target, started ? "Se trimite..." : "Ocupat, incearca din nou");
 }
 
 lv_obj_t* createCard(lv_obj_t* parent, const char* title, lv_obj_t** value) {
@@ -366,69 +436,68 @@ lv_obj_t* addButton(lv_obj_t* parent, const char* text, lv_event_cb_t callback, 
 
 void onPair(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->pairStatus, "Pairing...");
-    ctx->paired = pairGateway(ctx, lv_textarea_get_text(ctx->pairCode));
-    setLabel(ctx->pairStatus, ctx->paired ? "PAIR OK - secure link active" : "Pairing failed - retry");
+    const std::string code = lv_textarea_get_text(ctx->pairCode);
+    const bool started = runAsync(ctx->commandWorker, [ctx, code] {
+        const bool ok = pairGateway(ctx, code);
+        postLabel(ctx, ctx->pairStatus, ok ? "PAIR OK - secure link active" : "Pairing failed - retry");
+    });
+    setLabel(ctx->pairStatus, started ? "Pairing..." : "Ocupat, incearca din nou");
 }
 
 void onDial(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    const char* number = lv_textarea_get_text(ctx->phoneNumber);
-    setLabel(ctx->phoneStatus, sendCommand(ctx, "dial", number) ? "Dial command sent" : "Dial failed");
+    command(ctx, ctx->phoneStatus, "dial", "Dial command sent", "Dial failed", ctx->phoneNumber);
 }
 
 void onAnswer(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->phoneStatus, sendCommand(ctx, "answer") ? "Answered" : "Answer failed");
+    command(ctx, ctx->phoneStatus, "answer", "Answered", "Answer failed");
 }
 
 void onHold(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->phoneStatus, sendCommand(ctx, "hold") ? "Hold toggled" : "Hold failed");
+    command(ctx, ctx->phoneStatus, "hold", "Hold toggled", "Hold failed");
 }
 
 void onHangup(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->phoneStatus, sendCommand(ctx, "hangup") ? "Call ended" : "Hangup failed");
+    command(ctx, ctx->phoneStatus, "hangup", "Call ended", "Hangup failed");
 }
 
 void onSendSms(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    const bool ok = sendCommand(ctx, "sms", lv_textarea_get_text(ctx->smsNumber), lv_textarea_get_text(ctx->smsText));
-    setLabel(ctx->smsInbox, ok ? "SMS sent" : "SMS failed");
+    command(ctx, ctx->smsInbox, "sms", "SMS sent", "SMS failed", ctx->smsNumber, ctx->smsText);
 }
 
 void onReadSms(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->smsInbox, sendCommand(ctx, "sms_read_all") ? "Inbox marked read" : "Command failed");
+    command(ctx, ctx->smsInbox, "sms_read_all", "Inbox marked read", "Command failed");
 }
 
 void onGnssOn(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->gnssStatus, sendCommand(ctx, "gnss_on") ? "GNSS enabling..." : "GNSS command failed");
+    command(ctx, ctx->gnssStatus, "gnss_on", "GNSS enabling...", "GNSS command failed");
 }
 
 void onGnssOff(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->gnssStatus, sendCommand(ctx, "gnss_off") ? "GNSS disabling..." : "GNSS command failed");
+    command(ctx, ctx->gnssStatus, "gnss_off", "GNSS disabling...", "GNSS command failed");
 }
 
 void onModemRestart(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->quickStatus, sendCommand(ctx, "modem_reconnect")
-        ? "Restart modem trimis; reconectare in curs..." : "Restart modem esuat");
+    command(ctx, ctx->quickStatus, "modem_reconnect",
+        "Restart modem trimis; reconectare in curs...", "Restart modem esuat");
 }
 
 void onDataOn(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->quickStatus, sendCommand(ctx, "data_on")
-        ? "Date mobile activate" : "Gateway-ul necesita update pentru DATA ON");
+    command(ctx, ctx->quickStatus, "data_on", "Date mobile activate", "Gateway-ul necesita update pentru DATA ON");
 }
 
 void onDataOff(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    setLabel(ctx->quickStatus, sendCommand(ctx, "data_off")
-        ? "Date mobile oprite" : "Gateway-ul necesita update pentru DATA OFF");
+    command(ctx, ctx->quickStatus, "data_off", "Date mobile oprite", "Gateway-ul necesita update pentru DATA OFF");
 }
 
 lv_obj_t* addTab(lv_obj_t* tabview, const char* name) {
@@ -539,15 +608,16 @@ int32_t appMain(int, char**) {
     AppEventSubscription subscription {};
     check(app_event_subscribe(&subscription, &eventGroup) == ERROR_NONE);
 
-    const WindowId window = window_manager_create(ctx.appInstanceId, createWidgets, &ctx);
-    ctx.refreshTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(5000), [&ctx] { refresh(&ctx); });
     initIdentity(&ctx);
     ctx.paired = loadCredentials(&ctx);
+    const WindowId window = window_manager_create(ctx.appInstanceId, createWidgets, &ctx);
+    ctx.window = window;
     lvgl_lock();
-    setLabel(ctx.pairStatus, ctx.paired ? "PAIR OK - secure link active" : "Pairing failed - tap Pair");
+    setLabel(ctx.pairStatus, ctx.paired ? "PAIR OK - secure link active" : "Not paired - enter the gateway code");
     lvgl_unlock();
+    ctx.refreshTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(5000), [&ctx] { refreshAsync(&ctx); });
     ctx.refreshTimer->start();
-    refresh(&ctx);
+    refreshAsync(&ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
@@ -559,6 +629,8 @@ int32_t appMain(int, char**) {
     }
 
     ctx.refreshTimer->stop();
+    stopWorker(ctx.refreshWorker);
+    stopWorker(ctx.commandWorker);
     window_manager_remove(window);
     check(app_event_unsubscribe(&subscription) == ERROR_NONE);
     task_event_group_destruct(&eventGroup);

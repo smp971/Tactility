@@ -21,61 +21,16 @@
 #include <tactility/freertos/task.h>
 #include <tactility/log.h>
 #include <tactility/memory.h>
-#include <tactility/time.h>
 
 #include <Tactility/app/setup/Setup.h>
 #include <Tactility/settings/BootSettings.h>
 #include <Tactility/Tactility.h>
-#include <Tactility/Timer.h>
-
-#ifdef ESP_PLATFORM
-#include <esp_http_client.h>
-#endif
-
-#include <memory>
-#include <string>
 
 namespace tt::app::launcher {
 
 constexpr auto* TAG = "Launcher";
 
 namespace {
-
-struct LauncherContext {
-    lv_obj_t* gatewayBadge = nullptr;
-    std::unique_ptr<Timer> gatewayTimer;
-};
-
-#ifdef ESP_PLATFORM
-esp_err_t gatewayHttpEvent(esp_http_client_event_t*) { return ESP_OK; }
-
-bool gatewayOnline() {
-    esp_http_client_config_t config {};
-    config.url = "http://10.1.10.12/health";
-    config.method = HTTP_METHOD_GET;
-    config.timeout_ms = 2500;
-    config.event_handler = gatewayHttpEvent;
-    auto* client = esp_http_client_init(&config);
-    if (!client) return false;
-    const auto result = esp_http_client_perform(client);
-    const int status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-    return result == ESP_OK && status >= 200 && status < 300;
-}
-#else
-bool gatewayOnline() { return false; }
-#endif
-
-void refreshGatewayBadge(LauncherContext* context) {
-    const bool online = gatewayOnline();
-    lvgl_lock();
-    if (context->gatewayBadge && lv_obj_is_valid(context->gatewayBadge)) {
-        lv_label_set_text(context->gatewayBadge, online ? "4G  ONLINE" : "4G  OFFLINE");
-        lv_obj_set_style_text_color(context->gatewayBadge,
-            online ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_RED), 0);
-    }
-    lvgl_unlock();
-}
 
 uint32_t getButtonPadding(UiDensity density, uint32_t buttonSize) {
     if (density == LVGL_UI_DENSITY_COMPACT) {
@@ -187,8 +142,7 @@ void onButtonsWrapperResized(lv_event_t* e) {
     }
 }
 
-void createWidgets(lv_obj_t* parent, void* userData) {
-    auto* context = static_cast<LauncherContext*>(userData);
+void createWidgets(lv_obj_t* parent, void*) {
     auto* buttons_wrapper = lv_obj_create(parent);
 
     auto ui_density = lvgl_get_ui_density();
@@ -221,11 +175,6 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     auto* app_list_button = createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_APPS, "tactility.applist", margin, is_landscape_display);
     createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_FOLDER, "tactility.files", margin, is_landscape_display);
     createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_SETTINGS, "tactility.settings", margin, is_landscape_display);
-
-    context->gatewayBadge = lv_label_create(parent);
-    lv_label_set_text(context->gatewayBadge, "4G  ...");
-    lv_obj_set_style_text_font(context->gatewayBadge, lvgl_get_text_font(FONT_SIZE_SMALL), 0);
-    lv_obj_align(context->gatewayBadge, LV_ALIGN_BOTTOM_RIGHT, -8, -6);
 
     // The launcher's container is several levels below the screen, and LVGL only sends
     // LV_EVENT_SIZE_CHANGED to the screen object itself on a resolution change - so the
@@ -319,13 +268,7 @@ int32_t appMain(int argc, char* argv[]) {
     AppEventSubscription sub {};
     check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
 
-    LauncherContext context {};
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &context);
-    context.gatewayTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(10000), [&context] {
-        refreshGatewayBadge(&context);
-    });
-    context.gatewayTimer->start();
-    refreshGatewayBadge(&context);
+    WindowId window = window_manager_create(appInstanceId, createWidgets, nullptr);
 
     runAutoStartIsolated();
 
@@ -345,7 +288,6 @@ int32_t appMain(int argc, char* argv[]) {
         if (shouldClose) break;
     }
 
-    context.gatewayTimer->stop();
     window_manager_remove(window);
     check(app_event_unsubscribe(&sub) == ERROR_NONE);
     task_event_group_destruct(&event_group);
