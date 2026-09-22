@@ -22,6 +22,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -49,6 +50,14 @@ struct GeofenceZoneInfo {
     int idx = 0;
     std::string name;
     bool inside = false;
+};
+
+struct ScheduleEventInfo {
+    uint32_t id = 0;
+    std::string label;
+    int64_t fireAt = 0;
+    int repeat = 0; // 0=once, 1=daily, 2=weekly
+    bool enabled = true;
 };
 
 struct GatewayData {
@@ -97,6 +106,13 @@ struct GatewayData {
     int geofenceInsideCount = 0;
     std::vector<AutomationRuleInfo> automationRules;
     std::vector<GeofenceZoneInfo> geofenceZones;
+    bool watchdogEnabled = false;
+    bool watchdogOnline = false;
+    std::string watchdogHost;
+    int watchdogPort = 0;
+    int watchdogFailures = 0;
+    int watchdogThreshold = 0;
+    std::vector<ScheduleEventInfo> scheduleEvents;
 };
 
 struct Context {
@@ -139,6 +155,20 @@ struct Context {
     lv_obj_t* ruleDeleteId = nullptr;
     lv_obj_t* geoList = nullptr;
     lv_obj_t* geoDeleteIdx = nullptr;
+    lv_obj_t* watchdogStatus = nullptr;
+    lv_obj_t* watchdogHost = nullptr;
+    lv_obj_t* watchdogPort = nullptr;
+    lv_obj_t* watchdogInterval = nullptr;
+    lv_obj_t* watchdogFailures = nullptr;
+    lv_obj_t* watchdogSmsTo = nullptr;
+    lv_obj_t* watchdogEnabledSwitch = nullptr;
+    lv_obj_t* scheduleList = nullptr;
+    lv_obj_t* scheduleLabel = nullptr;
+    lv_obj_t* scheduleMinutes = nullptr;
+    lv_obj_t* scheduleRepeat = nullptr;
+    lv_obj_t* scheduleSmsTo = nullptr;
+    lv_obj_t* scheduleSmsText = nullptr;
+    lv_obj_t* scheduleDeleteId = nullptr;
     // Coada separata pt istoricul CSQ (nu concureaza cu refreshWorker/
     // commandWorker — refresh-ul principal ramane neblocat de asta).
     std::unique_ptr<Thread> csqWorker;
@@ -369,10 +399,44 @@ bool sendGeofenceZone(Context* ctx, const std::string& name, double lat, double 
 // vezi node_gateway_control_post() in webserver.c), spre deosebire de restul
 // comenzilor simple; de-asta nu folosim command()/sendCommand() aici (acelea
 // trimit mereu string).
-bool sendDeleteById(Context* ctx, const char* deleteCommand, int id) {
+// int64_t, nu int: ID-urile de scheduler vin din esp_random() (0..UINT32_MAX
+// complet), care poate depasi INT32_MAX — un `int` ar trunchia/UB la parsare.
+bool sendDeleteById(Context* ctx, const char* deleteCommand, int64_t id) {
     cJSON* json = cJSON_CreateObject();
     cJSON_AddStringToObject(json, "command", deleteCommand);
-    cJSON_AddNumberToObject(json, "value", id);
+    cJSON_AddNumberToObject(json, "value", static_cast<double>(id));
+    return postCommandJson(ctx, json);
+}
+
+bool sendWatchdogConfig(Context* ctx, bool enabled, const std::string& host, int port,
+                        int intervalS, int failures, const std::string& smsTo) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", "host_watchdog_set");
+    cJSON_AddBoolToObject(json, "enabled", enabled);
+    cJSON_AddStringToObject(json, "host", host.c_str());
+    cJSON_AddNumberToObject(json, "port", port);
+    cJSON_AddNumberToObject(json, "interval_s", intervalS);
+    cJSON_AddNumberToObject(json, "failures", failures);
+    cJSON_AddStringToObject(json, "sms_to", smsTo.c_str());
+    cJSON_AddBoolToObject(json, "notify_recovery", true);
+    return postCommandJson(ctx, json);
+}
+
+// fireAt = timp Unix absolut (calculat pe T-HMI din "peste N minute" +
+// ceasul local, sincronizat NTP) — gateway-ul nu stie "acum" din perspectiva
+// T-HMI, doar accepta un timestamp absolut (vezi scheduler_upsert_json in
+// scheduler.c, care cere fire_at >= VALID_TIME_EPOCH).
+bool sendScheduleEvent(Context* ctx, const std::string& label, int64_t fireAt, int repeat,
+                        const std::string& smsTo, const std::string& smsText) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", "schedule_upsert");
+    cJSON* event = cJSON_AddObjectToObject(json, "event");
+    cJSON_AddStringToObject(event, "label", label.c_str());
+    cJSON_AddNumberToObject(event, "fire_at", static_cast<double>(fireAt));
+    cJSON_AddNumberToObject(event, "repeat", repeat);
+    cJSON_AddStringToObject(event, "sms_to", smsTo.c_str());
+    cJSON_AddStringToObject(event, "sms_text", smsText.c_str());
+    cJSON_AddBoolToObject(event, "enabled", true);
     return postCommandJson(ctx, json);
 }
 
@@ -449,6 +513,25 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
             data.geofenceZones.push_back(std::move(info));
         }
     }
+    data.watchdogEnabled = jsonBool(root, "watchdog_enabled");
+    data.watchdogOnline = jsonBool(root, "watchdog_online");
+    data.watchdogHost = jsonString(root, "watchdog_host");
+    data.watchdogPort = jsonInt(root, "watchdog_port");
+    data.watchdogFailures = jsonInt(root, "watchdog_failures");
+    data.watchdogThreshold = jsonInt(root, "watchdog_threshold");
+    auto* scheduleEvents = cJSON_GetObjectItemCaseSensitive(root, "schedule_events");
+    if (cJSON_IsArray(scheduleEvents)) {
+        cJSON* item = nullptr;
+        cJSON_ArrayForEach(item, scheduleEvents) {
+            ScheduleEventInfo info;
+            info.id = static_cast<uint32_t>(jsonDouble(item, "id"));
+            info.label = jsonString(item, "label");
+            info.fireAt = static_cast<int64_t>(jsonDouble(item, "fire_at"));
+            info.repeat = jsonInt(item, "repeat");
+            info.enabled = jsonBool(item, "enabled", true);
+            data.scheduleEvents.push_back(std::move(info));
+        }
+    }
     auto* sms = cJSON_GetObjectItemCaseSensitive(root, "sms");
     if (cJSON_IsArray(sms) && cJSON_GetArraySize(sms) > 0) {
         auto* first = cJSON_GetArrayItem(sms, 0);
@@ -485,7 +568,9 @@ bool sendCommand(Context*, const char*, const char* = nullptr, const char* = nul
 bool sendMqttConfig(Context*, const std::string&, const std::string&, const std::string&) { return false; }
 bool sendAutomationRule(Context*, const std::string&, const std::string&, int, const std::string&) { return false; }
 bool sendGeofenceZone(Context*, const std::string&, double, double, double) { return false; }
-bool sendDeleteById(Context*, const char*, int) { return false; }
+bool sendDeleteById(Context*, const char*, int64_t) { return false; }
+bool sendWatchdogConfig(Context*, bool, const std::string&, int, int, int, const std::string&) { return false; }
+bool sendScheduleEvent(Context*, const std::string&, int64_t, int, const std::string&, const std::string&) { return false; }
 bool fetchGateway(Context*, GatewayData&) { return false; }
 std::vector<int> fetchCsqHistory(Context*) { return {}; }
 #endif
@@ -594,6 +679,33 @@ void render(Context* ctx, const GatewayData& data) {
                 text += row;
             }
             setLabel(ctx->geoList, text.empty() ? "Nicio zona inca." : text.c_str());
+        }
+        if (ctx->watchdogStatus != nullptr) {
+            char wdLine[128];
+            if (!data.watchdogEnabled) {
+                std::snprintf(wdLine, sizeof(wdLine), "Oprit. Configureaza mai jos ca sa-l activezi.");
+            } else {
+                std::snprintf(wdLine, sizeof(wdLine), "%s:%d — %s (%d/%d esecuri)",
+                    data.watchdogHost.empty() ? "--" : data.watchdogHost.c_str(), data.watchdogPort,
+                    data.watchdogOnline ? "ONLINE" : "DOWN", data.watchdogFailures, data.watchdogThreshold);
+            }
+            setLabel(ctx->watchdogStatus, wdLine);
+        }
+        if (ctx->scheduleList != nullptr) {
+            std::string text;
+            for (const auto& event : data.scheduleEvents) {
+                std::time_t fireTime = static_cast<std::time_t>(event.fireAt);
+                std::tm local {};
+                localtime_r(&fireTime, &local);
+                char stamp[24];
+                std::strftime(stamp, sizeof(stamp), "%d.%m %H:%M", &local);
+                static const char* repeatText[] = {"o data", "zilnic", "saptamanal"};
+                char row[160];
+                std::snprintf(row, sizeof(row), "#%u %s — %s (%s)%s\n", static_cast<unsigned int>(event.id), event.label.c_str(),
+                    stamp, repeatText[event.repeat < 3 ? event.repeat : 0], event.enabled ? "" : " [oprit]");
+                text += row;
+            }
+            setLabel(ctx->scheduleList, text.empty() ? "Niciun eveniment inca." : text.c_str());
         }
     }
 }
@@ -851,6 +963,70 @@ void onDeleteGeofence(lv_event_t* event) {
     setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
 }
 
+void onSaveWatchdog(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string host = lv_textarea_get_text(ctx->watchdogHost);
+    const std::string portText = lv_textarea_get_text(ctx->watchdogPort);
+    const std::string intervalText = lv_textarea_get_text(ctx->watchdogInterval);
+    const std::string failuresText = lv_textarea_get_text(ctx->watchdogFailures);
+    const std::string smsTo = lv_textarea_get_text(ctx->watchdogSmsTo);
+    const bool enabled = lv_obj_has_state(ctx->watchdogEnabledSwitch, LV_STATE_CHECKED);
+    if (host.empty() || smsTo.empty()) {
+        setLabel(ctx->configFeedback, "Watchdog: completeaza host si numar SMS");
+        return;
+    }
+    const int port = portText.empty() ? 443 : std::atoi(portText.c_str());
+    const int interval = intervalText.empty() ? 60 : std::atoi(intervalText.c_str());
+    const int failures = failuresText.empty() ? 3 : std::atoi(failuresText.c_str());
+    const bool started = runAsync(ctx->commandWorker, [ctx, enabled, host, port, interval, failures, smsTo] {
+        const bool ok = sendWatchdogConfig(ctx, enabled, host, port, interval, failures, smsTo);
+        postLabel(ctx, ctx->configFeedback, ok ? "Watchdog salvat" : "Watchdog esuat");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
+void onAddScheduleEvent(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string label = lv_textarea_get_text(ctx->scheduleLabel);
+    const std::string minutesText = lv_textarea_get_text(ctx->scheduleMinutes);
+    const std::string smsTo = lv_textarea_get_text(ctx->scheduleSmsTo);
+    const std::string smsText = lv_textarea_get_text(ctx->scheduleSmsText);
+    if (label.empty() || minutesText.empty() || smsTo.empty() || smsText.empty()) {
+        setLabel(ctx->configFeedback, "Completeaza toate campurile evenimentului");
+        return;
+    }
+    const int minutes = std::atoi(minutesText.c_str());
+    if (minutes <= 0) {
+        setLabel(ctx->configFeedback, "Minutele trebuie sa fie un numar pozitiv");
+        return;
+    }
+    const uint32_t repeatIdx = lv_dropdown_get_selected(ctx->scheduleRepeat);
+    // Ceasul T-HMI trebuie sincronizat (NTP) — altfel fire_at calculat aici e greșit.
+    const int64_t fireAt = static_cast<int64_t>(std::time(nullptr)) + static_cast<int64_t>(minutes) * 60;
+    const bool started = runAsync(ctx->commandWorker, [ctx, label, fireAt, repeatIdx, smsTo, smsText] {
+        const bool ok = sendScheduleEvent(ctx, label, fireAt, static_cast<int>(repeatIdx), smsTo, smsText);
+        postLabel(ctx, ctx->configFeedback, ok ? "Eveniment salvat" : "Eveniment esuat");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
+void onDeleteScheduleEvent(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string idText = lv_textarea_get_text(ctx->scheduleDeleteId);
+    if (idText.empty()) {
+        setLabel(ctx->configFeedback, "Scrie ID-ul evenimentului (vezi # din lista)");
+        return;
+    }
+    // strtoul, nu atoi: ID-urile de scheduler vin din esp_random() si pot
+    // depasi INT32_MAX (atoi ar avea comportament nedefinit pe acele valori).
+    const int64_t id = static_cast<int64_t>(std::strtoul(idText.c_str(), nullptr, 10));
+    const bool started = runAsync(ctx->commandWorker, [ctx, id] {
+        const bool ok = sendDeleteById(ctx, "schedule_delete", id);
+        postLabel(ctx, ctx->configFeedback, ok ? "Eveniment sters" : "Stergere esuata (ID gresit?)");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
 lv_obj_t* addTab(lv_obj_t* tabview, const char* name) {
     auto* tab = lv_tabview_add_tab(tabview, name);
     lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
@@ -1090,6 +1266,93 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_textarea_set_placeholder_text(ctx->geoDeleteIdx, "Index zona de sters (vezi # din lista)");
     lv_obj_set_width(ctx->geoDeleteIdx, LV_PCT(100));
     addButton(config, "Sterge zona", onDeleteGeofence, ctx);
+
+    // Host watchdog: motorul exista deja pe gateway (host_watchdog.c),
+    // configurabil doar din WebUI pana acum.
+    auto* watchdogTitle = lv_label_create(config);
+    lv_label_set_text(watchdogTitle, "MONITOR DISPONIBILITATE (HOST WATCHDOG)");
+    lv_obj_set_style_text_color(watchdogTitle, lv_theme_get_color_primary(watchdogTitle), 0);
+    ctx->watchdogStatus = lv_label_create(config);
+    lv_label_set_text(ctx->watchdogStatus, "Se incarca...");
+    lv_obj_set_width(ctx->watchdogStatus, LV_PCT(100));
+    auto* watchdogEnableRow = lv_obj_create(config);
+    lv_obj_set_width(watchdogEnableRow, LV_PCT(100));
+    lv_obj_set_height(watchdogEnableRow, LV_SIZE_CONTENT);
+    lv_obj_set_style_border_width(watchdogEnableRow, 0, 0);
+    lv_obj_set_style_bg_opa(watchdogEnableRow, LV_OPA_TRANSP, 0);
+    lv_obj_set_flex_flow(watchdogEnableRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(watchdogEnableRow, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    auto* watchdogEnableLabel = lv_label_create(watchdogEnableRow);
+    lv_label_set_text(watchdogEnableLabel, "Activ");
+    ctx->watchdogEnabledSwitch = lv_switch_create(watchdogEnableRow);
+    ctx->watchdogHost = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->watchdogHost, true);
+    lv_textarea_set_placeholder_text(ctx->watchdogHost, "Host/IP de monitorizat");
+    lv_obj_set_width(ctx->watchdogHost, LV_PCT(100));
+    ctx->watchdogPort = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->watchdogPort, true);
+    lv_textarea_set_accepted_chars(ctx->watchdogPort, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->watchdogPort, "Port TCP (ex: 443)");
+    lv_obj_set_width(ctx->watchdogPort, LV_PCT(100));
+    ctx->watchdogInterval = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->watchdogInterval, true);
+    lv_textarea_set_accepted_chars(ctx->watchdogInterval, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->watchdogInterval, "Interval verificare (secunde, ex: 60)");
+    lv_obj_set_width(ctx->watchdogInterval, LV_PCT(100));
+    ctx->watchdogFailures = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->watchdogFailures, true);
+    lv_textarea_set_accepted_chars(ctx->watchdogFailures, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->watchdogFailures, "Esecuri pana la alarma (ex: 3)");
+    lv_obj_set_width(ctx->watchdogFailures, LV_PCT(100));
+    ctx->watchdogSmsTo = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->watchdogSmsTo, true);
+    lv_textarea_set_accepted_chars(ctx->watchdogSmsTo, "+0123456789");
+    lv_textarea_set_placeholder_text(ctx->watchdogSmsTo, "Numar SMS alerta");
+    lv_obj_set_width(ctx->watchdogSmsTo, LV_PCT(100));
+    addButton(config, "Salveaza watchdog", onSaveWatchdog, ctx);
+
+    // Scheduler (calendar): motorul exista deja pe gateway (scheduler.c —
+    // SMS programate, o data/zilnic/saptamanal), configurabil doar din WebUI
+    // pana acum.
+    auto* scheduleTitle = lv_label_create(config);
+    lv_label_set_text(scheduleTitle, "EVENIMENTE PROGRAMATE EXISTENTE");
+    lv_obj_set_style_text_color(scheduleTitle, lv_theme_get_color_primary(scheduleTitle), 0);
+    ctx->scheduleList = lv_label_create(config);
+    lv_label_set_text(ctx->scheduleList, "Se incarca...");
+    lv_label_set_long_mode(ctx->scheduleList, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->scheduleList, LV_PCT(100));
+    ctx->scheduleDeleteId = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->scheduleDeleteId, true);
+    lv_textarea_set_accepted_chars(ctx->scheduleDeleteId, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->scheduleDeleteId, "ID eveniment de sters (vezi # din lista)");
+    lv_obj_set_width(ctx->scheduleDeleteId, LV_PCT(100));
+    addButton(config, "Sterge eveniment", onDeleteScheduleEvent, ctx);
+
+    auto* scheduleAddTitle = lv_label_create(config);
+    lv_label_set_text(scheduleAddTitle, "EVENIMENT NOU");
+    lv_obj_set_style_text_color(scheduleAddTitle, lv_theme_get_color_primary(scheduleAddTitle), 0);
+    ctx->scheduleLabel = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->scheduleLabel, true);
+    lv_textarea_set_placeholder_text(ctx->scheduleLabel, "Nume eveniment");
+    lv_obj_set_width(ctx->scheduleLabel, LV_PCT(100));
+    ctx->scheduleMinutes = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->scheduleMinutes, true);
+    lv_textarea_set_accepted_chars(ctx->scheduleMinutes, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->scheduleMinutes, "Peste cate minute (necesita ceas T-HMI sincronizat)");
+    lv_obj_set_width(ctx->scheduleMinutes, LV_PCT(100));
+    ctx->scheduleRepeat = lv_dropdown_create(config);
+    lv_dropdown_set_options(ctx->scheduleRepeat, "O singura data\nZilnic\nSaptamanal");
+    lv_obj_set_width(ctx->scheduleRepeat, LV_PCT(100));
+    ctx->scheduleSmsTo = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->scheduleSmsTo, true);
+    lv_textarea_set_accepted_chars(ctx->scheduleSmsTo, "+0123456789");
+    lv_textarea_set_placeholder_text(ctx->scheduleSmsTo, "Numar SMS destinatie");
+    lv_obj_set_width(ctx->scheduleSmsTo, LV_PCT(100));
+    ctx->scheduleSmsText = lv_textarea_create(config);
+    lv_textarea_set_placeholder_text(ctx->scheduleSmsText, "Text SMS");
+    lv_textarea_set_max_length(ctx->scheduleSmsText, 120);
+    lv_obj_set_width(ctx->scheduleSmsText, LV_PCT(100));
+    addButton(config, "Adauga eveniment", onAddScheduleEvent, ctx);
 
     ctx->configFeedback = lv_label_create(config);
     lv_label_set_text(ctx->configFeedback, "");
