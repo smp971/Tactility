@@ -35,6 +35,22 @@ namespace {
 
 constexpr auto* GATEWAY_URL = "http://10.1.10.12/health";
 
+struct AutomationRuleInfo {
+    int id = 0;
+    std::string name;
+    std::string trigger;
+    int threshold = 0;
+    std::string action;
+    bool enabled = true;
+    bool latched = false;
+};
+
+struct GeofenceZoneInfo {
+    int idx = 0;
+    std::string name;
+    bool inside = false;
+};
+
 struct GatewayData {
     bool online = false;
     bool atReady = false;
@@ -79,6 +95,8 @@ struct GatewayData {
     int automationLatchedCount = 0;
     int geofenceZoneCount = 0;
     int geofenceInsideCount = 0;
+    std::vector<AutomationRuleInfo> automationRules;
+    std::vector<GeofenceZoneInfo> geofenceZones;
 };
 
 struct Context {
@@ -117,6 +135,10 @@ struct Context {
     lv_obj_t* ruleAction = nullptr;
     lv_obj_t* geoName = nullptr;
     lv_obj_t* geoRadius = nullptr;
+    lv_obj_t* ruleList = nullptr;
+    lv_obj_t* ruleDeleteId = nullptr;
+    lv_obj_t* geoList = nullptr;
+    lv_obj_t* geoDeleteIdx = nullptr;
     // Coada separata pt istoricul CSQ (nu concureaza cu refreshWorker/
     // commandWorker — refresh-ul principal ramane neblocat de asta).
     std::unique_ptr<Thread> csqWorker;
@@ -343,6 +365,17 @@ bool sendGeofenceZone(Context* ctx, const std::string& name, double lat, double 
     return postCommandJson(ctx, json);
 }
 
+// automation_delete/geofence_remove cer "value" ca NUMAR JSON (nu string —
+// vezi node_gateway_control_post() in webserver.c), spre deosebire de restul
+// comenzilor simple; de-asta nu folosim command()/sendCommand() aici (acelea
+// trimit mereu string).
+bool sendDeleteById(Context* ctx, const char* deleteCommand, int id) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", deleteCommand);
+    cJSON_AddNumberToObject(json, "value", id);
+    return postCommandJson(ctx, json);
+}
+
 bool fetchGateway(Context* ctx, GatewayData& data) {
     std::string body;
     const auto identity = creds(ctx);
@@ -392,6 +425,15 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
         cJSON* rule = nullptr;
         cJSON_ArrayForEach(rule, rules) {
             if (jsonBool(rule, "latched")) data.automationLatchedCount++;
+            AutomationRuleInfo info;
+            info.id = jsonInt(rule, "id");
+            info.name = jsonString(rule, "name");
+            info.trigger = jsonString(rule, "trigger");
+            info.threshold = jsonInt(rule, "threshold");
+            info.action = jsonString(rule, "action");
+            info.enabled = jsonBool(rule, "enabled", true);
+            info.latched = jsonBool(rule, "latched");
+            data.automationRules.push_back(std::move(info));
         }
     }
     auto* zones = cJSON_GetObjectItemCaseSensitive(root, "geofence_zones");
@@ -400,6 +442,11 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
         cJSON* zone = nullptr;
         cJSON_ArrayForEach(zone, zones) {
             if (jsonBool(zone, "inside")) data.geofenceInsideCount++;
+            GeofenceZoneInfo info;
+            info.idx = jsonInt(zone, "idx");
+            info.name = jsonString(zone, "name");
+            info.inside = jsonBool(zone, "inside");
+            data.geofenceZones.push_back(std::move(info));
         }
     }
     auto* sms = cJSON_GetObjectItemCaseSensitive(root, "sms");
@@ -438,6 +485,7 @@ bool sendCommand(Context*, const char*, const char* = nullptr, const char* = nul
 bool sendMqttConfig(Context*, const std::string&, const std::string&, const std::string&) { return false; }
 bool sendAutomationRule(Context*, const std::string&, const std::string&, int, const std::string&) { return false; }
 bool sendGeofenceZone(Context*, const std::string&, double, double, double) { return false; }
+bool sendDeleteById(Context*, const char*, int) { return false; }
 bool fetchGateway(Context*, GatewayData&) { return false; }
 std::vector<int> fetchCsqHistory(Context*) { return {}; }
 #endif
@@ -523,6 +571,30 @@ void render(Context* ctx, const GatewayData& data) {
             data.geofenceInsideCount > 0 ? " (in zona)" : "",
             data.wolConfigured ? data.wolName.empty() ? "configurat" : data.wolName.c_str() : "neconfigurat");
         setLabel(ctx->configStatus, line);
+
+        if (ctx->ruleList != nullptr) {
+            std::string text;
+            for (const auto& rule : data.automationRules) {
+                char row[128];
+                std::snprintf(row, sizeof(row), "#%d %s: %s%s%s -> %s%s\n",
+                    rule.id, rule.name.c_str(), rule.trigger.c_str(),
+                    rule.trigger == "internet_down" ? "" : " < ",
+                    rule.trigger == "internet_down" ? "" : std::to_string(rule.threshold).c_str(),
+                    rule.action.c_str(), rule.latched ? " (ACTIVA)" : "");
+                text += row;
+            }
+            setLabel(ctx->ruleList, text.empty() ? "Nicio regula inca." : text.c_str());
+        }
+        if (ctx->geoList != nullptr) {
+            std::string text;
+            for (const auto& zone : data.geofenceZones) {
+                char row[96];
+                std::snprintf(row, sizeof(row), "#%d %s%s\n", zone.idx, zone.name.c_str(),
+                    zone.inside ? " (esti aici)" : "");
+                text += row;
+            }
+            setLabel(ctx->geoList, text.empty() ? "Nicio zona inca." : text.c_str());
+        }
     }
 }
 
@@ -749,6 +821,36 @@ void onAddGeofence(lv_event_t* event) {
     setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
 }
 
+void onDeleteRule(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string idText = lv_textarea_get_text(ctx->ruleDeleteId);
+    if (idText.empty()) {
+        setLabel(ctx->configFeedback, "Scrie ID-ul regulii (vezi #N din lista)");
+        return;
+    }
+    const int id = std::atoi(idText.c_str());
+    const bool started = runAsync(ctx->commandWorker, [ctx, id] {
+        const bool ok = sendDeleteById(ctx, "automation_delete", id);
+        postLabel(ctx, ctx->configFeedback, ok ? "Regula stearsa" : "Stergere esuata (ID gresit?)");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
+void onDeleteGeofence(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string idxText = lv_textarea_get_text(ctx->geoDeleteIdx);
+    if (idxText.empty()) {
+        setLabel(ctx->configFeedback, "Scrie indexul zonei (vezi #N din lista)");
+        return;
+    }
+    const int idx = std::atoi(idxText.c_str());
+    const bool started = runAsync(ctx->commandWorker, [ctx, idx] {
+        const bool ok = sendDeleteById(ctx, "geofence_remove", idx);
+        postLabel(ctx, ctx->configFeedback, ok ? "Zona stearsa" : "Stergere esuata (index gresit?)");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
 lv_obj_t* addTab(lv_obj_t* tabview, const char* name) {
     auto* tab = lv_tabview_add_tab(tabview, name);
     lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
@@ -947,6 +1049,20 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_width(ctx->ruleAction, LV_PCT(100));
     addButton(config, "Adauga regula", onAddRule, ctx);
 
+    auto* ruleListTitle = lv_label_create(config);
+    lv_label_set_text(ruleListTitle, "REGULI EXISTENTE");
+    lv_obj_set_style_text_color(ruleListTitle, lv_theme_get_color_primary(ruleListTitle), 0);
+    ctx->ruleList = lv_label_create(config);
+    lv_label_set_text(ctx->ruleList, "Se incarca...");
+    lv_label_set_long_mode(ctx->ruleList, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->ruleList, LV_PCT(100));
+    ctx->ruleDeleteId = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->ruleDeleteId, true);
+    lv_textarea_set_accepted_chars(ctx->ruleDeleteId, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->ruleDeleteId, "ID regula de sters (vezi # din lista)");
+    lv_obj_set_width(ctx->ruleDeleteId, LV_PCT(100));
+    addButton(config, "Sterge regula", onDeleteRule, ctx);
+
     auto* geoLabel = lv_label_create(config);
     lv_label_set_text(geoLabel, "ZONA GEOFENCE NOUA (pozitia curenta gateway)");
     lv_obj_set_style_text_color(geoLabel, lv_theme_get_color_primary(geoLabel), 0);
@@ -960,6 +1076,20 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_textarea_set_placeholder_text(ctx->geoRadius, "Raza in metri (ex: 100)");
     lv_obj_set_width(ctx->geoRadius, LV_PCT(100));
     addButton(config, "Adauga zona (necesita fix GNSS)", onAddGeofence, ctx);
+
+    auto* geoListTitle = lv_label_create(config);
+    lv_label_set_text(geoListTitle, "ZONE EXISTENTE");
+    lv_obj_set_style_text_color(geoListTitle, lv_theme_get_color_primary(geoListTitle), 0);
+    ctx->geoList = lv_label_create(config);
+    lv_label_set_text(ctx->geoList, "Se incarca...");
+    lv_label_set_long_mode(ctx->geoList, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->geoList, LV_PCT(100));
+    ctx->geoDeleteIdx = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->geoDeleteIdx, true);
+    lv_textarea_set_accepted_chars(ctx->geoDeleteIdx, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->geoDeleteIdx, "Index zona de sters (vezi # din lista)");
+    lv_obj_set_width(ctx->geoDeleteIdx, LV_PCT(100));
+    addButton(config, "Sterge zona", onDeleteGeofence, ctx);
 
     ctx->configFeedback = lv_label_create(config);
     lv_label_set_text(ctx->configFeedback, "");

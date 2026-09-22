@@ -17,8 +17,11 @@
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
+#include <nvs.h>
 #endif
 
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <cmath>
 #include <memory>
@@ -27,8 +30,35 @@
 namespace tt::app::deskclock {
 namespace {
 
-constexpr auto* FORECAST_URL = "https://api.open-meteo.com/v1/forecast?latitude=44.4323&longitude=26.1063&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=Europe%2FBucharest&forecast_days=3";
+// Implicit: Bucuresti. Configurabil din UI (buton "Setari" in toolbar),
+// persistat in NVS — vezi loadLocation()/saveLocation().
+constexpr auto* DEFAULT_CITY = "Bucuresti";
+constexpr double DEFAULT_LAT = 44.4323;
+constexpr double DEFAULT_LON = 26.1063;
 constexpr auto* GATEWAY_URL = "http://10.1.10.12/health";
+
+struct Location {
+    std::string city = DEFAULT_CITY;
+    double lat = DEFAULT_LAT;
+    double lon = DEFAULT_LON;
+};
+
+std::string forecastUrl(const Location& loc) {
+    // timezone=auto: Open-Meteo deduce fusul orar din coordonate — nu mai
+    // trebuie sa presupunem Europe/Bucharest pt un oras oarecare.
+    // Buffer generos: GCC estimează pesimist lățimea maximă a unui %f pt un
+    // double oarecare (sute de caractere teoretic), chiar dacă lat/lon sunt
+    // mereu în intervale mici — altfel -Werror=format-truncation blochează
+    // build-ul.
+    char url[400];
+    std::snprintf(url, sizeof(url),
+        "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        "&timezone=auto&forecast_days=3",
+        loc.lat, loc.lon);
+    return url;
+}
 
 struct Weather {
     bool forecastOk = false;
@@ -63,7 +93,15 @@ struct Context {
     lv_obj_t* metricCards[3] {};
     lv_obj_t* metricLabels[3] {};
     lv_obj_t* footer = nullptr;
+    // Rand de setari locatie, ascuns implicit — comutat cu butonul "Setari"
+    // din toolbar, ca sa nu aglomereze ecranul de ceas cu campuri text.
+    lv_obj_t* locationRow = nullptr;
+    lv_obj_t* cityInput = nullptr;
+    lv_obj_t* latInput = nullptr;
+    lv_obj_t* lonInput = nullptr;
+    lv_obj_t* locationFeedback = nullptr;
     Weather weather;
+    Location location;
     WindowId window = 0;
     std::unique_ptr<Timer> clockTimer;
     std::unique_ptr<Timer> weatherTimer;
@@ -110,9 +148,9 @@ double arrayNumber(cJSON* object, const char* key, int index, double fallback = 
     return cJSON_IsNumber(item) ? item->valuedouble : fallback;
 }
 
-void fetchWeather(Weather& weather) {
+void fetchWeather(const Location& location, Weather& weather) {
     std::string body;
-    if (get(FORECAST_URL, true, body)) {
+    if (get(forecastUrl(location).c_str(), true, body)) {
         auto* root = cJSON_Parse(body.c_str());
         auto* current = root ? cJSON_GetObjectItemCaseSensitive(root, "current") : nullptr;
         auto* daily = root ? cJSON_GetObjectItemCaseSensitive(root, "daily") : nullptr;
@@ -148,8 +186,40 @@ void fetchWeather(Weather& weather) {
         cJSON_Delete(root);
     }
 }
+
+void loadLocation(Location& location) {
+    nvs_handle_t handle;
+    if (nvs_open("deskclock", NVS_READONLY, &handle) != ESP_OK) return;
+    char city[32] {};
+    size_t citySize = sizeof(city);
+    if (nvs_get_str(handle, "city", city, &citySize) == ESP_OK && city[0]) location.city = city;
+    // Coordonatele sunt stocate ca text (format "%.4f", vezi saveLocation) —
+    // consistent cu restul aplicatiei (Gateway4G foloseste acelasi tipar
+    // value/text simplu, fara blob-uri binare).
+    char lat[16] {}, lon[16] {};
+    size_t latSize = sizeof(lat), lonSize = sizeof(lon);
+    if (nvs_get_str(handle, "lat", lat, &latSize) == ESP_OK && lat[0]) location.lat = std::atof(lat);
+    if (nvs_get_str(handle, "lon", lon, &lonSize) == ESP_OK && lon[0]) location.lon = std::atof(lon);
+    nvs_close(handle);
+}
+
+bool saveLocation(const Location& location) {
+    nvs_handle_t handle;
+    if (nvs_open("deskclock", NVS_READWRITE, &handle) != ESP_OK) return false;
+    char lat[16], lon[16];
+    std::snprintf(lat, sizeof(lat), "%.4f", location.lat);
+    std::snprintf(lon, sizeof(lon), "%.4f", location.lon);
+    esp_err_t err = nvs_set_str(handle, "city", location.city.c_str());
+    if (err == ESP_OK) err = nvs_set_str(handle, "lat", lat);
+    if (err == ESP_OK) err = nvs_set_str(handle, "lon", lon);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err == ESP_OK;
+}
 #else
-void fetchWeather(Weather&) {}
+void fetchWeather(const Location&, Weather&) {}
+void loadLocation(Location&) {}
+bool saveLocation(const Location&) { return false; }
 #endif
 
 const char* description(int code) {
@@ -218,7 +288,7 @@ void renderWeather(Context* ctx) {
     const auto& w = ctx->weather;
     lv_label_set_text(ctx->currentIcon, weatherIcon(w.code));
     lv_obj_set_style_text_color(ctx->currentIcon, weatherColor(w.code, w.isDay), 0);
-    lv_label_set_text_fmt(ctx->condition, "%s | Bucuresti", description(w.code));
+    lv_label_set_text_fmt(ctx->condition, "%s | %s", description(w.code), ctx->location.city.c_str());
     if (w.forecastOk) {
         const auto outdoor = decimal1(w.outdoor);
         const auto apparent = decimal1(w.apparent);
@@ -241,8 +311,11 @@ void renderWeather(Context* ctx) {
 }
 
 void refreshWeather(Context* ctx) {
+    lvgl_lock();
+    const Location location = ctx->location; // copie — evita orice cursa cu butonul de salvare
+    lvgl_unlock();
     Weather next;
-    fetchWeather(next);
+    fetchWeather(location, next);
     lvgl_lock();
     ctx->weather = next;
     if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED) {
@@ -269,12 +342,39 @@ void onBack(lv_event_t* event) {
     app_event_emit_close(static_cast<Context*>(lv_event_get_user_data(event))->appInstanceId);
 }
 
+void onToggleSettings(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (lv_obj_has_flag(ctx->locationRow, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_remove_flag(ctx->locationRow, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ctx->locationRow, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void onSaveLocation(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string city = lv_textarea_get_text(ctx->cityInput);
+    const std::string latText = lv_textarea_get_text(ctx->latInput);
+    const std::string lonText = lv_textarea_get_text(ctx->lonInput);
+    if (city.empty() || latText.empty() || lonText.empty()) {
+        lv_label_set_text(ctx->locationFeedback, "Completeaza oras, lat si lon");
+        return;
+    }
+    ctx->location.city = city;
+    ctx->location.lat = std::atof(latText.c_str());
+    ctx->location.lon = std::atof(lonText.c_str());
+    const bool saved = saveLocation(ctx->location);
+    lv_label_set_text(ctx->locationFeedback, saved ? "Salvat — se actualizeaza prognoza..." : "Eroare la salvare");
+    refreshWeatherAsync(ctx);
+}
+
 void createWidgets(lv_obj_t* parent, void* data) {
     auto* ctx = static_cast<Context*>(data);
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(parent, 0, 0);
     auto* toolbar = lvgl_toolbar_create(parent, "Desk Clock");
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBack, ctx);
+    lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_SETTINGS, onToggleSettings, ctx);
     auto* content = lv_obj_create(parent);
     ctx->content = content;
     lv_obj_set_width(content, LV_PCT(100));
@@ -332,6 +432,64 @@ void createWidgets(lv_obj_t* parent, void* data) {
     }
     ctx->footer = lv_label_create(content);
     lv_obj_set_style_text_opa(ctx->footer, LV_OPA_50, 0);
+
+    // Setari locatie — ascunse implicit, comutate cu butonul din toolbar.
+    ctx->locationRow = lv_obj_create(content);
+    lv_obj_add_flag(ctx->locationRow, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_width(ctx->locationRow, LV_PCT(96));
+    lv_obj_set_height(ctx->locationRow, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(ctx->locationRow, 10, 0);
+    lv_obj_set_style_pad_all(ctx->locationRow, 6, 0);
+    lv_obj_set_flex_flow(ctx->locationRow, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->locationRow, 4, 0);
+    auto* locationTitle = lv_label_create(ctx->locationRow);
+    lv_label_set_text(locationTitle, "LOCATIE METEO");
+    lv_obj_set_style_text_color(locationTitle, lv_theme_get_color_primary(locationTitle), 0);
+    ctx->cityInput = lv_textarea_create(ctx->locationRow);
+    lv_textarea_set_one_line(ctx->cityInput, true);
+    lv_textarea_set_text(ctx->cityInput, ctx->location.city.c_str());
+    lv_textarea_set_placeholder_text(ctx->cityInput, "Oras");
+    lv_obj_set_width(ctx->cityInput, LV_PCT(100));
+    auto* coordRow = lv_obj_create(ctx->locationRow);
+    lv_obj_set_width(coordRow, LV_PCT(100));
+    lv_obj_set_height(coordRow, LV_SIZE_CONTENT);
+    lv_obj_set_style_border_width(coordRow, 0, 0);
+    lv_obj_set_style_bg_opa(coordRow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(coordRow, 0, 0);
+    lv_obj_set_style_pad_column(coordRow, 4, 0);
+    lv_obj_set_flex_flow(coordRow, LV_FLEX_FLOW_ROW);
+    ctx->latInput = lv_textarea_create(coordRow);
+    lv_textarea_set_one_line(ctx->latInput, true);
+    lv_textarea_set_accepted_chars(ctx->latInput, "-0123456789.");
+    {
+        char latText[16];
+        std::snprintf(latText, sizeof(latText), "%.4f", ctx->location.lat);
+        lv_textarea_set_text(ctx->latInput, latText);
+    }
+    lv_textarea_set_placeholder_text(ctx->latInput, "Latitudine");
+    lv_obj_set_flex_grow(ctx->latInput, 1);
+    ctx->lonInput = lv_textarea_create(coordRow);
+    lv_textarea_set_one_line(ctx->lonInput, true);
+    lv_textarea_set_accepted_chars(ctx->lonInput, "-0123456789.");
+    {
+        char lonText[16];
+        std::snprintf(lonText, sizeof(lonText), "%.4f", ctx->location.lon);
+        lv_textarea_set_text(ctx->lonInput, lonText);
+    }
+    lv_textarea_set_placeholder_text(ctx->lonInput, "Longitudine");
+    lv_obj_set_flex_grow(ctx->lonInput, 1);
+    auto* saveButton = lv_button_create(ctx->locationRow);
+    lv_obj_set_width(saveButton, LV_PCT(100));
+    lv_obj_add_event_cb(saveButton, onSaveLocation, LV_EVENT_SHORT_CLICKED, ctx);
+    auto* saveLabel = lv_label_create(saveButton);
+    lv_label_set_text(saveLabel, "Salveaza locatia");
+    lv_obj_center(saveLabel);
+    ctx->locationFeedback = lv_label_create(ctx->locationRow);
+    lv_label_set_text(ctx->locationFeedback, "Coordonatele se gasesc usor pe hartii online (ex: Google Maps).");
+    lv_label_set_long_mode(ctx->locationFeedback, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_opa(ctx->locationFeedback, LV_OPA_60, 0);
+    lv_obj_set_width(ctx->locationFeedback, LV_PCT(100));
+
     updateClock(ctx);
     renderWeather(ctx);
 }
@@ -343,6 +501,7 @@ int32_t appMain(int, char**) {
     task_event_group_construct(&events);
     AppEventSubscription subscription {};
     check(app_event_subscribe(&subscription, &events) == ERROR_NONE);
+    loadLocation(ctx.location); // trebuie inainte de createWidgets — pre-completeaza campurile
     WindowId window = window_manager_create(ctx.appInstanceId, createWidgets, &ctx);
     ctx.window = window;
     ctx.clockTimer = std::make_unique<Timer>(Timer::Type::Periodic, seconds_to_ticks(1), [&ctx] {
