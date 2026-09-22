@@ -21,11 +21,13 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace tt::app::gateway4g {
 
@@ -68,6 +70,15 @@ struct GatewayData {
     uint64_t txPackets = 0;
     uint64_t rxPackets = 0;
     std::string smsPreview;
+    bool mqttConnected = false;
+    std::string mqttUri;
+    bool telegramConfigured = false;
+    bool wolConfigured = false;
+    std::string wolName;
+    int automationRuleCount = 0;
+    int automationLatchedCount = 0;
+    int geofenceZoneCount = 0;
+    int geofenceInsideCount = 0;
 };
 
 struct Context {
@@ -85,12 +96,37 @@ struct Context {
     lv_obj_t* smsInbox = nullptr;
     lv_obj_t* gnssStatus = nullptr;
     lv_obj_t* quickStatus = nullptr;
+    // Tab "Config": stare motoare existente pe gateway (automation/telegram/
+    // mqtt/geofence) + editare Wi-Fi/APN/MQTT + adaugare regula/zona, fara
+    // sa fie nevoie de telefon langa gateway pt WebUI.
+    lv_obj_t* configStatus = nullptr;
+    lv_obj_t* configFeedback = nullptr;
+    lv_obj_t* csqChart = nullptr;
+    lv_chart_series_t* csqSeries = nullptr;
+    lv_obj_t* staSsid = nullptr;
+    lv_obj_t* staPass = nullptr;
+    lv_obj_t* apn = nullptr;
+    lv_obj_t* mqttUri = nullptr;
+    lv_obj_t* mqttUser = nullptr;
+    lv_obj_t* mqttPass = nullptr;
+    lv_obj_t* telegramToken = nullptr;
+    lv_obj_t* telegramChat = nullptr;
+    lv_obj_t* ruleName = nullptr;
+    lv_obj_t* ruleTrigger = nullptr;
+    lv_obj_t* ruleThreshold = nullptr;
+    lv_obj_t* ruleAction = nullptr;
+    lv_obj_t* geoName = nullptr;
+    lv_obj_t* geoRadius = nullptr;
+    // Coada separata pt istoricul CSQ (nu concureaza cu refreshWorker/
+    // commandWorker — refresh-ul principal ramane neblocat de asta).
+    std::unique_ptr<Thread> csqWorker;
     std::string nodeId;
     std::string key;
     bool paired = false;
     std::mutex credLock;
     WindowId window = 0;
     std::unique_ptr<Timer> refreshTimer;
+    std::unique_ptr<Timer> csqTimer;
     std::unique_ptr<Thread> refreshWorker;
     std::unique_ptr<Thread> commandWorker;
 };
@@ -251,13 +287,9 @@ bool pairGateway(Context* ctx, const std::string& pairCode) {
     return true;
 }
 
-bool sendCommand(Context* ctx, const char* command, const char* value = nullptr, const char* text = nullptr) {
+bool postCommandJson(Context* ctx, cJSON* json) {
     const auto identity = creds(ctx);
-    if (!identity.paired) return false;
-    cJSON* json = cJSON_CreateObject();
-    cJSON_AddStringToObject(json, "command", command);
-    if (value) cJSON_AddStringToObject(json, "value", value);
-    if (text) cJSON_AddStringToObject(json, "text", text);
+    if (!identity.paired) { cJSON_Delete(json); return false; }
     char* encoded = cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
     if (!encoded) return false;
@@ -266,6 +298,49 @@ bool sendCommand(Context* ctx, const char* command, const char* value = nullptr,
         encoded, identity.nodeId, identity.key, response, 30000);
     cJSON_free(encoded);
     return ok;
+}
+
+bool sendCommand(Context* ctx, const char* command, const char* value = nullptr, const char* text = nullptr) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", command);
+    if (value) cJSON_AddStringToObject(json, "value", value);
+    if (text) cJSON_AddStringToObject(json, "text", text);
+    return postCommandJson(ctx, json);
+}
+
+// Comenzi cu mai multe campuri decat perechea generica value/text suporta —
+// vezi node_gateway_control_post() in webserver.c (gateway) pt formatul
+// exact asteptat de fiecare.
+bool sendMqttConfig(Context* ctx, const std::string& uri, const std::string& user, const std::string& pass) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", "set_mqtt");
+    cJSON_AddStringToObject(json, "value", uri.c_str());
+    if (!user.empty()) cJSON_AddStringToObject(json, "text", user.c_str());
+    if (!pass.empty()) cJSON_AddStringToObject(json, "mqtt_pass", pass.c_str());
+    return postCommandJson(ctx, json);
+}
+
+bool sendAutomationRule(Context* ctx, const std::string& name, const std::string& trigger,
+                         int threshold, const std::string& action) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", "automation_upsert");
+    cJSON* rule = cJSON_AddObjectToObject(json, "rule");
+    cJSON_AddStringToObject(rule, "name", name.c_str());
+    cJSON_AddStringToObject(rule, "trigger", trigger.c_str());
+    cJSON_AddNumberToObject(rule, "threshold", threshold);
+    cJSON_AddStringToObject(rule, "action", action.c_str());
+    cJSON_AddBoolToObject(rule, "enabled", true);
+    return postCommandJson(ctx, json);
+}
+
+bool sendGeofenceZone(Context* ctx, const std::string& name, double lat, double lon, double radius) {
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "command", "geofence_add");
+    cJSON_AddStringToObject(json, "value", name.c_str());
+    cJSON_AddNumberToObject(json, "lat", lat);
+    cJSON_AddNumberToObject(json, "lon", lon);
+    cJSON_AddNumberToObject(json, "radius", radius);
+    return postCommandJson(ctx, json);
 }
 
 bool fetchGateway(Context* ctx, GatewayData& data) {
@@ -306,6 +381,27 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
     data.unreadSms = jsonInt(root, "unread_sms");
     data.txPackets = static_cast<uint64_t>(jsonDouble(root, "tx_packets"));
     data.rxPackets = static_cast<uint64_t>(jsonDouble(root, "rx_packets"));
+    data.mqttConnected = jsonBool(root, "mqtt_connected");
+    data.mqttUri = jsonString(root, "mqtt_uri");
+    data.telegramConfigured = jsonBool(root, "telegram_configured");
+    data.wolConfigured = jsonBool(root, "wol_configured");
+    data.wolName = jsonString(root, "wol_name");
+    auto* rules = cJSON_GetObjectItemCaseSensitive(root, "automation_rules");
+    if (cJSON_IsArray(rules)) {
+        data.automationRuleCount = cJSON_GetArraySize(rules);
+        cJSON* rule = nullptr;
+        cJSON_ArrayForEach(rule, rules) {
+            if (jsonBool(rule, "latched")) data.automationLatchedCount++;
+        }
+    }
+    auto* zones = cJSON_GetObjectItemCaseSensitive(root, "geofence_zones");
+    if (cJSON_IsArray(zones)) {
+        data.geofenceZoneCount = cJSON_GetArraySize(zones);
+        cJSON* zone = nullptr;
+        cJSON_ArrayForEach(zone, zones) {
+            if (jsonBool(zone, "inside")) data.geofenceInsideCount++;
+        }
+    }
     auto* sms = cJSON_GetObjectItemCaseSensitive(root, "sms");
     if (cJSON_IsArray(sms) && cJSON_GetArraySize(sms) > 0) {
         auto* first = cJSON_GetArrayItem(sms, 0);
@@ -314,12 +410,36 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
     cJSON_Delete(root);
     return true;
 }
+
+// Ultimele (cel mult) 60 valori CSQ, cele mai vechi primele — gata pt un
+// lv_chart cu point_count fix. Gol daca cererea eșuează sau nu e pereche.
+std::vector<int> fetchCsqHistory(Context* ctx) {
+    std::vector<int> out;
+    const auto identity = creds(ctx);
+    if (!identity.paired) return out;
+    std::string body;
+    if (!request("http://10.1.10.12/api/node/csq_history", HTTP_METHOD_GET, nullptr,
+                 identity.nodeId, identity.key, body)) return out;
+    auto* root = cJSON_Parse(body.c_str());
+    if (!cJSON_IsArray(root)) { cJSON_Delete(root); return out; }
+    int count = cJSON_GetArraySize(root);
+    int start = count > 60 ? count - 60 : 0;
+    for (int i = start; i < count; ++i) {
+        out.push_back(jsonInt(cJSON_GetArrayItem(root, i), "csq", -1));
+    }
+    cJSON_Delete(root);
+    return out;
+}
 #else
 void initIdentity(Context*) {}
 bool loadCredentials(Context*) { return false; }
 bool pairGateway(Context*, const std::string&) { return false; }
 bool sendCommand(Context*, const char*, const char* = nullptr, const char* = nullptr) { return false; }
+bool sendMqttConfig(Context*, const std::string&, const std::string&, const std::string&) { return false; }
+bool sendAutomationRule(Context*, const std::string&, const std::string&, int, const std::string&) { return false; }
+bool sendGeofenceZone(Context*, const std::string&, double, double, double) { return false; }
 bool fetchGateway(Context*, GatewayData&) { return false; }
+std::vector<int> fetchCsqHistory(Context*) { return {}; }
 #endif
 
 void render(Context* ctx, const GatewayData& data) {
@@ -380,6 +500,30 @@ void render(Context* ctx, const GatewayData& data) {
         data.firmware.empty() ? "gateway" : data.firmware.c_str(),
         data.uptime / 3600, (data.uptime / 60) % 60);
     setLabel(ctx->footer, line);
+
+    if (ctx->paired && ctx->configStatus != nullptr) {
+        // Notificare vizuala: orice regula automation "latched" acum sau
+        // baterie critica apare cu ATENTIE in fata — restul motoarelor (deja
+        // functionale pe gateway, doar neexpuse pana acum) arata starea lor.
+        const bool lowBattery = data.battery >= 0 && data.battery < 15;
+        char alert[64] = "";
+        if (data.automationLatchedCount > 0) {
+            std::snprintf(alert, sizeof(alert), "ATENTIE: %d regula(i) activa(e)\n", data.automationLatchedCount);
+        } else if (lowBattery) {
+            std::snprintf(alert, sizeof(alert), "ATENTIE: baterie gateway %d%%\n", data.battery);
+        }
+        std::snprintf(line, sizeof(line),
+            "%sMQTT %s   Telegram %s\nAutomation: %d reguli%s   Geofence: %d zone%s\nWOL: %s",
+            alert,
+            data.mqttConnected ? "conectat" : "oprit",
+            data.telegramConfigured ? "configurat" : "neconfigurat",
+            data.automationRuleCount,
+            data.automationLatchedCount > 0 ? " (activa!)" : "",
+            data.geofenceZoneCount,
+            data.geofenceInsideCount > 0 ? " (in zona)" : "",
+            data.wolConfigured ? data.wolName.empty() ? "configurat" : data.wolName.c_str() : "neconfigurat");
+        setLabel(ctx->configStatus, line);
+    }
 }
 
 void refresh(Context* ctx) {
@@ -395,6 +539,27 @@ void refresh(Context* ctx) {
 // Runs from the timer task: only queues the request, never blocks.
 void refreshAsync(Context* ctx) {
     runAsync(ctx->refreshWorker, [ctx] { refresh(ctx); });
+}
+
+void refreshCsq(Context* ctx) {
+    const auto history = fetchCsqHistory(ctx);
+    if (history.empty()) return;
+    lvgl_lock();
+    if (window_manager_get_state(ctx->window) == WINDOW_STATE_GRANTED &&
+        ctx->csqChart != nullptr && ctx->csqSeries != nullptr) {
+        lv_chart_set_point_count(ctx->csqChart, static_cast<uint32_t>(history.size()));
+        std::vector<int32_t> values(history.begin(), history.end());
+        lv_chart_set_series_values(ctx->csqChart, ctx->csqSeries, values.data(), values.size());
+        lv_chart_refresh(ctx->csqChart);
+    }
+    lvgl_unlock();
+}
+
+// Rulează pe propria coadă (csqWorker), separată de refreshWorker — istoricul
+// e o cerere HTTP separată, mai rar necesară, n-are voie să întârzie
+// refresh-ul principal de stare (la 5s).
+void refreshCsqAsync(Context* ctx) {
+    runAsync(ctx->csqWorker, [ctx] { refreshCsq(ctx); });
 }
 
 // Called from LVGL event handlers: copies the inputs, then sends the command off the LVGL thread.
@@ -507,6 +672,83 @@ void onDataOff(lv_event_t* event) {
     command(ctx, ctx->quickStatus, "data_off", "Date mobile oprite", "Gateway-ul necesita update pentru DATA OFF");
 }
 
+void onSaveWifi(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    command(ctx, ctx->configFeedback, "set_sta", "Wi-Fi salvat pe gateway", "Wi-Fi esuat (SSID lipsa?)",
+        ctx->staSsid, ctx->staPass);
+}
+
+void onSaveApn(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    command(ctx, ctx->configFeedback, "set_apn", "APN salvat pe gateway", "APN esuat (camp gol?)", ctx->apn);
+}
+
+void onSaveMqtt(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string uri = lv_textarea_get_text(ctx->mqttUri);
+    const std::string user = lv_textarea_get_text(ctx->mqttUser);
+    const std::string pass = lv_textarea_get_text(ctx->mqttPass);
+    const bool started = runAsync(ctx->commandWorker, [ctx, uri, user, pass] {
+        const bool ok = sendMqttConfig(ctx, uri, user, pass);
+        postLabel(ctx, ctx->configFeedback, ok ? "MQTT salvat pe gateway" : "MQTT esuat (URI lipsa?)");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
+void onSaveTelegram(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    command(ctx, ctx->configFeedback, "telegram_set", "Telegram salvat pe gateway", "Telegram esuat",
+        ctx->telegramToken, ctx->telegramChat);
+}
+
+constexpr const char* AUTOMATION_TRIGGERS[] = { "internet_down", "csq_below", "battery_below" };
+constexpr const char* AUTOMATION_ACTIONS[] = { "alert", "broadcast", "led" };
+
+void onAddRule(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string name = lv_textarea_get_text(ctx->ruleName);
+    const std::string thresholdText = lv_textarea_get_text(ctx->ruleThreshold);
+    const int threshold = thresholdText.empty() ? 0 : std::atoi(thresholdText.c_str());
+    const uint32_t triggerIdx = lv_dropdown_get_selected(ctx->ruleTrigger);
+    const uint32_t actionIdx = lv_dropdown_get_selected(ctx->ruleAction);
+    const std::string trigger = AUTOMATION_TRIGGERS[triggerIdx < 3 ? triggerIdx : 0];
+    const std::string action = AUTOMATION_ACTIONS[actionIdx < 3 ? actionIdx : 0];
+    if (name.empty()) {
+        setLabel(ctx->configFeedback, "Regula are nevoie de un nume");
+        return;
+    }
+    const bool started = runAsync(ctx->commandWorker, [ctx, name, trigger, threshold, action] {
+        const bool ok = sendAutomationRule(ctx, name, trigger, threshold, action);
+        postLabel(ctx, ctx->configFeedback, ok ? "Regula automation salvata" : "Regula esuata");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
+void onAddGeofence(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    const std::string name = lv_textarea_get_text(ctx->geoName);
+    const std::string radiusText = lv_textarea_get_text(ctx->geoRadius);
+    const double radius = radiusText.empty() ? 0 : std::atof(radiusText.c_str());
+    // Folosim pozitia GNSS curenta a gateway-ului (interogata proaspat mai
+    // jos) — evita introducerea manuala de coordonate zecimale pe tastatura T-HMI.
+    if (name.empty() || radius <= 0) {
+        setLabel(ctx->configFeedback, "Zona are nevoie de nume si raza > 0");
+        return;
+    }
+    const bool started = runAsync(ctx->commandWorker, [ctx, name, radius] {
+        GatewayData data;
+        fetchGateway(ctx, data);
+        bool ok = false;
+        if (data.gnssFix) {
+            ok = sendGeofenceZone(ctx, name, data.latitude, data.longitude, radius);
+        }
+        postLabel(ctx, ctx->configFeedback,
+            !data.gnssFix ? "Fara fix GNSS — nu stiu poziția curenta" :
+            ok ? "Zona geofence salvata (poziția curenta)" : "Zona esuata");
+    });
+    setLabel(ctx->configFeedback, started ? "Se trimite..." : "Ocupat, incearca din nou");
+}
+
 lv_obj_t* addTab(lv_obj_t* tabview, const char* name) {
     auto* tab = lv_tabview_add_tab(tabview, name);
     lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
@@ -532,6 +774,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     auto* phone = addTab(tabs, "Phone");
     auto* sms = addTab(tabs, "SMS");
     auto* gnss = addTab(tabs, "GNSS");
+    auto* config = addTab(tabs, "Config");
 
     ctx->connection = lv_label_create(content);
     lv_label_set_text(ctx->connection, "Se conecteaza la 10.1.10.12...");
@@ -550,7 +793,27 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     addButton(quickButtons, "DATA ON", onDataOn, ctx);
     addButton(quickButtons, "DATA OFF", onDataOff, ctx);
     addButton(quickButtons, "RESTART", onModemRestart, ctx);
+
+    // Istoric semnal (CSQ) — motorul exista deja pe gateway (300 puncte in
+    // RAM), doar neexpus pe T-HMI pana acum. Actualizat mai rar decat restul
+    // (vezi appMain: doar la fiecare al 4-lea tick), ca sa nu incarce refresh-ul principal.
+    auto* csqLabel = lv_label_create(content);
+    lv_label_set_text(csqLabel, "ISTORIC SEMNAL (CSQ)");
+    lv_obj_set_style_text_color(csqLabel, lv_theme_get_color_primary(csqLabel), 0);
+    ctx->csqChart = lv_chart_create(content);
+    lv_obj_set_size(ctx->csqChart, LV_PCT(100), 70);
+    lv_chart_set_type(ctx->csqChart, LV_CHART_TYPE_LINE);
+    lv_chart_set_axis_range(ctx->csqChart, LV_CHART_AXIS_PRIMARY_Y, 0, 31);
+    lv_chart_set_point_count(ctx->csqChart, 1);
+    // Populat prin lv_chart_set_series_values() (tot array-ul dintr-o dată,
+    // vezi refreshCsq()) — nu prin lv_chart_set_next_value(), deci modul de
+    // update implicit (nu shift) e cel corect aici.
+    ctx->csqSeries = lv_chart_add_series(ctx->csqChart, lv_theme_get_color_primary(ctx->csqChart), LV_CHART_AXIS_PRIMARY_Y);
+
     createCard(content, "SENZORI GATEWAY", &ctx->environment);
+    ctx->configStatus = lv_label_create(content);
+    lv_label_set_text(ctx->configStatus, "MQTT/Telegram/Automation/Geofence: se incarca...");
+    lv_obj_set_width(ctx->configStatus, LV_PCT(100));
 
     ctx->pairStatus = lv_label_create(content);
     lv_label_set_text(ctx->pairStatus, "Open Pairing on gateway, then enter code");
@@ -604,6 +867,103 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_label_set_text(ctx->gnssStatus, "GNSS loading...");
     addButton(gnss, "GNSS ON", onGnssOn, ctx);
     addButton(gnss, "GNSS OFF", onGnssOff, ctx);
+
+    // Tab "Config": editare directa a setarilor de retea ale gateway-ului
+    // (Wi-Fi/APN/MQTT/Telegram) + adaugare regula automation/zona geofence,
+    // fara sa fie nevoie de telefon/laptop langa gateway pt WebUI. Toate
+    // motoarele exista deja pe gateway — vezi node_gateway_control_post()
+    // in webserver.c.
+    auto* wifiLabel = lv_label_create(config);
+    lv_label_set_text(wifiLabel, "WI-FI LOCAL (gateway)");
+    lv_obj_set_style_text_color(wifiLabel, lv_theme_get_color_primary(wifiLabel), 0);
+    ctx->staSsid = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->staSsid, true);
+    lv_textarea_set_placeholder_text(ctx->staSsid, "SSID");
+    lv_obj_set_width(ctx->staSsid, LV_PCT(100));
+    ctx->staPass = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->staPass, true);
+    lv_textarea_set_password_mode(ctx->staPass, true);
+    lv_textarea_set_placeholder_text(ctx->staPass, "Parola (necompletat = neschimbata)");
+    lv_obj_set_width(ctx->staPass, LV_PCT(100));
+    addButton(config, "Salveaza Wi-Fi", onSaveWifi, ctx);
+
+    auto* apnLabel = lv_label_create(config);
+    lv_label_set_text(apnLabel, "APN MODEM");
+    lv_obj_set_style_text_color(apnLabel, lv_theme_get_color_primary(apnLabel), 0);
+    ctx->apn = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->apn, true);
+    lv_textarea_set_placeholder_text(ctx->apn, "ex: net, internet");
+    lv_obj_set_width(ctx->apn, LV_PCT(100));
+    addButton(config, "Salveaza APN", onSaveApn, ctx);
+
+    auto* mqttLabel = lv_label_create(config);
+    lv_label_set_text(mqttLabel, "MQTT / HOME ASSISTANT");
+    lv_obj_set_style_text_color(mqttLabel, lv_theme_get_color_primary(mqttLabel), 0);
+    ctx->mqttUri = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->mqttUri, true);
+    lv_textarea_set_placeholder_text(ctx->mqttUri, "mqtt://broker-ip:1883");
+    lv_obj_set_width(ctx->mqttUri, LV_PCT(100));
+    ctx->mqttUser = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->mqttUser, true);
+    lv_textarea_set_placeholder_text(ctx->mqttUser, "Utilizator (optional)");
+    lv_obj_set_width(ctx->mqttUser, LV_PCT(100));
+    ctx->mqttPass = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->mqttPass, true);
+    lv_textarea_set_password_mode(ctx->mqttPass, true);
+    lv_textarea_set_placeholder_text(ctx->mqttPass, "Parola (optional)");
+    lv_obj_set_width(ctx->mqttPass, LV_PCT(100));
+    addButton(config, "Salveaza MQTT", onSaveMqtt, ctx);
+
+    auto* telegramLabel = lv_label_create(config);
+    lv_label_set_text(telegramLabel, "TELEGRAM");
+    lv_obj_set_style_text_color(telegramLabel, lv_theme_get_color_primary(telegramLabel), 0);
+    ctx->telegramToken = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->telegramToken, true);
+    lv_textarea_set_placeholder_text(ctx->telegramToken, "Bot token");
+    lv_obj_set_width(ctx->telegramToken, LV_PCT(100));
+    ctx->telegramChat = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->telegramChat, true);
+    lv_textarea_set_placeholder_text(ctx->telegramChat, "Chat ID");
+    lv_obj_set_width(ctx->telegramChat, LV_PCT(100));
+    addButton(config, "Salveaza Telegram", onSaveTelegram, ctx);
+
+    auto* ruleLabel = lv_label_create(config);
+    lv_label_set_text(ruleLabel, "REGULA AUTOMATION NOUA");
+    lv_obj_set_style_text_color(ruleLabel, lv_theme_get_color_primary(ruleLabel), 0);
+    ctx->ruleName = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->ruleName, true);
+    lv_textarea_set_placeholder_text(ctx->ruleName, "Nume regula");
+    lv_obj_set_width(ctx->ruleName, LV_PCT(100));
+    ctx->ruleTrigger = lv_dropdown_create(config);
+    lv_dropdown_set_options(ctx->ruleTrigger, "Internet jos\nSemnal (CSQ) sub prag\nBaterie sub prag");
+    lv_obj_set_width(ctx->ruleTrigger, LV_PCT(100));
+    ctx->ruleThreshold = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->ruleThreshold, true);
+    lv_textarea_set_accepted_chars(ctx->ruleThreshold, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->ruleThreshold, "Prag (irelevant pt 'internet jos')");
+    lv_obj_set_width(ctx->ruleThreshold, LV_PCT(100));
+    ctx->ruleAction = lv_dropdown_create(config);
+    lv_dropdown_set_options(ctx->ruleAction, "Alerta locala\nBroadcast catre noduri\nLED");
+    lv_obj_set_width(ctx->ruleAction, LV_PCT(100));
+    addButton(config, "Adauga regula", onAddRule, ctx);
+
+    auto* geoLabel = lv_label_create(config);
+    lv_label_set_text(geoLabel, "ZONA GEOFENCE NOUA (pozitia curenta gateway)");
+    lv_obj_set_style_text_color(geoLabel, lv_theme_get_color_primary(geoLabel), 0);
+    ctx->geoName = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->geoName, true);
+    lv_textarea_set_placeholder_text(ctx->geoName, "Nume zona (ex: Acasa)");
+    lv_obj_set_width(ctx->geoName, LV_PCT(100));
+    ctx->geoRadius = lv_textarea_create(config);
+    lv_textarea_set_one_line(ctx->geoRadius, true);
+    lv_textarea_set_accepted_chars(ctx->geoRadius, "0123456789");
+    lv_textarea_set_placeholder_text(ctx->geoRadius, "Raza in metri (ex: 100)");
+    lv_obj_set_width(ctx->geoRadius, LV_PCT(100));
+    addButton(config, "Adauga zona (necesita fix GNSS)", onAddGeofence, ctx);
+
+    ctx->configFeedback = lv_label_create(config);
+    lv_label_set_text(ctx->configFeedback, "");
+    lv_obj_set_style_text_opa(ctx->configFeedback, LV_OPA_70, 0);
 }
 
 int32_t appMain(int, char**) {
@@ -625,6 +985,11 @@ int32_t appMain(int, char**) {
     ctx.refreshTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(5000), [&ctx] { refreshAsync(&ctx); });
     ctx.refreshTimer->start();
     refreshAsync(&ctx);
+    // Istoric CSQ: mult mai rar decat refresh-ul principal — e doar un grafic
+    // de tendinta, nu are nevoie de cadenta de 5s.
+    ctx.csqTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(20000), [&ctx] { refreshCsqAsync(&ctx); });
+    ctx.csqTimer->start();
+    refreshCsqAsync(&ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
@@ -636,8 +1001,10 @@ int32_t appMain(int, char**) {
     }
 
     ctx.refreshTimer->stop();
+    ctx.csqTimer->stop();
     stopWorker(ctx.refreshWorker);
     stopWorker(ctx.commandWorker);
+    stopWorker(ctx.csqWorker);
     window_manager_remove(window);
     check(app_event_unsubscribe(&subscription) == ERROR_NONE);
     task_event_group_destruct(&eventGroup);
