@@ -61,8 +61,12 @@ struct GatewayData {
     bool callHeld = false;
     std::string callNumber;
     int unreadSms = 0;
-    uint64_t txBytes = 0;
-    uint64_t rxBytes = 0;
+    // Contor lwIP GLOBAL de pachete (WiFi AP+STA+PPP combinate, nu doar
+    // 4G) — gateway-ul nu are un contor de octeți per-interfață PPP fără
+    // hook la nivel netif (evitat intenționat, zonă fragilă). Vezi
+    // docs/PERFORMANCE.md din repo-ul gateway-ului.
+    uint64_t txPackets = 0;
+    uint64_t rxPackets = 0;
     std::string smsPreview;
 };
 
@@ -300,8 +304,8 @@ bool fetchGateway(Context* ctx, GatewayData& data) {
     data.callHeld = jsonBool(root, "call_held");
     data.callNumber = jsonString(root, "call_number");
     data.unreadSms = jsonInt(root, "unread_sms");
-    data.txBytes = static_cast<uint64_t>(jsonDouble(root, "tx_bytes"));
-    data.rxBytes = static_cast<uint64_t>(jsonDouble(root, "rx_bytes"));
+    data.txPackets = static_cast<uint64_t>(jsonDouble(root, "tx_packets"));
+    data.rxPackets = static_cast<uint64_t>(jsonDouble(root, "rx_packets"));
     auto* sms = cJSON_GetObjectItemCaseSensitive(root, "sms");
     if (cJSON_IsArray(sms) && cJSON_GetArraySize(sms) > 0) {
         auto* first = cJSON_GetArrayItem(sms, 0);
@@ -338,11 +342,14 @@ void render(Context* ctx, const GatewayData& data) {
         data.wanIp.empty() ? "--" : data.wanIp.c_str());
     setLabel(ctx->modem, line);
 
-    if (data.txBytes || data.rxBytes) {
-        std::snprintf(line, sizeof(line), "RX %.1f MB   TX %.1f MB",
-            data.rxBytes / 1048576.0, data.txBytes / 1048576.0);
+    if (data.txPackets || data.rxPackets) {
+        // Pachete lwIP totale pe placa gateway (WiFi AP+STA+PPP combinate),
+        // nu octeți — gateway-ul nu are un contor de octeți per-interfață 4G.
+        std::snprintf(line, sizeof(line), "RX %llu   TX %llu pachete (gateway, total)",
+            static_cast<unsigned long long>(data.rxPackets),
+            static_cast<unsigned long long>(data.txPackets));
     } else {
-        std::snprintf(line, sizeof(line), "Trafic RX/TX: necesita update gateway");
+        std::snprintf(line, sizeof(line), "Trafic: fara date inca");
     }
     setLabel(ctx->quickStatus, line);
 
