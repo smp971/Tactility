@@ -37,11 +37,44 @@ void onBackPressed(lv_event_t* event) {
     app_event_emit_close(ctx->appInstanceId);
 }
 
+// The upstream AppManifest struct has no per-app icon field anymore (removed
+// in a kernel refactor) — every row would otherwise show the same generic
+// toolbar glyph, making the list hard to scan at a glance. This table is
+// entirely local to this file (doesn't touch AppManifest), so it can't
+// conflict with upstream syncs; an app not listed here just falls back to
+// the old generic icon, same as before.
+struct IconEntry { const char* id; const char* icon; };
+constexpr IconEntry ICONS[] = {
+    {"tactility.apppackagelist",   LVGL_ICON_SHARED_DEPLOYED_CODE},
+    {"tactility.audiosettings",    LVGL_ICON_SHARED_MUSIC_NOTE},
+    {"tactility.btmanage",         LVGL_ICON_SHARED_BLUETOOTH},
+    {"tactility.development",      LVGL_ICON_SHARED_APP_REGISTRATION},
+    {"tactility.display",          LVGL_ICON_SHARED_DISPLAY_SETTINGS},
+    {"tactility.gpssettings",      LVGL_ICON_SHARED_NAVIGATION},
+    {"tactility.grovesettings",    LVGL_ICON_SHARED_CABLE},
+    {"tactility.keyboardsettings", LVGL_ICON_SHARED_KEYBOARD_ALT},
+    {"tactility.localesettings",   LVGL_ICON_SHARED_LANGUAGE},
+    {"tactility.power",            LVGL_ICON_SHARED_POWER_SETTINGS_NEW},
+    {"tactility.timedatesettings", LVGL_ICON_SHARED_CALENDAR_MONTH},
+    {"tactility.touchcalibration", LVGL_ICON_SHARED_CIRCLE},
+    {"tactility.trackballsettings",LVGL_ICON_SHARED_DEVICES},
+    {"tactility.usbsettings",      LVGL_ICON_SHARED_USB},
+    {"tactility.wifimanage",       LVGL_ICON_SHARED_WIFI},
+    // Fork-specific apps, when/if they ever get category=Settings.
+    {"tactility.gateway4g",        LVGL_ICON_SHARED_CABLE},
+    {"tactility.controlcenter",    LVGL_ICON_SHARED_APPS},
+};
+
+const char* iconFor(const ::AppManifest* manifest) {
+    for (const auto& entry : ICONS) {
+        if (!strcmp(manifest->id, entry.id)) return entry.icon;
+    }
+    return LVGL_ICON_SHARED_TOOLBAR;
+}
+
 void createWidget(const ::AppManifest* manifest, lv_obj_t* list) {
     check(list);
-    // The new AppManifest has no per-app icon - use a shared generic one for every entry,
-    // same fallback the old model used for apps that didn't provide one.
-    auto* btn = lv_list_add_button(list, LVGL_ICON_SHARED_TOOLBAR, manifest->name);
+    auto* btn = lv_list_add_button(list, iconFor(manifest), manifest->name);
     lv_obj_t* image = lv_obj_get_child(btn, 0);
     lv_obj_set_style_text_font(image, lvgl_get_shared_icon_font(), LV_PART_MAIN);
     lv_obj_add_event_cb(btn, &onAppPressed, LV_EVENT_SHORT_CLICKED, const_cast<::AppManifest*>(manifest));
