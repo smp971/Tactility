@@ -56,6 +56,23 @@ if (DEFINED ENV{ESP_IDF_VERSION})
         "Libraries/QRCode"
     )
 
+    # Fork extension point: out-of-tree ESP-IDF components (e.g. N0D3 DeskOS "fusion_thmi", see
+    # lilygo-thmi-v2 in that repository). TT_EXTRA_COMPONENT_DIRS = ';'-separated directories that
+    # contain components, TT_EXTRA_COMPONENTS = ';'-separated component names to build (COMPONENTS
+    # above restricts the build to Tactility's dependency tree, so they must be listed explicitly).
+    # Their registration function is force-linked (see -u below) so the weak reference in
+    # Tactility.cpp resolves. Both unset => the build is identical to stock.
+    if (DEFINED ENV{TT_EXTRA_COMPONENT_DIRS})
+        string(REPLACE "\\" "/" TT_EXTRA_DIRS "$ENV{TT_EXTRA_COMPONENT_DIRS}")
+        list(APPEND EXTRA_COMPONENT_DIRS ${TT_EXTRA_DIRS})
+        message("Fork extra component dirs: ${TT_EXTRA_DIRS}")
+    endif ()
+    if (DEFINED ENV{TT_EXTRA_COMPONENTS})
+        list(APPEND COMPONENTS $ENV{TT_EXTRA_COMPONENTS})
+        idf_build_set_property(LINK_OPTIONS "-Wl,-u,tt_fork_register_apps" APPEND)
+        message("Fork extra components: $ENV{TT_EXTRA_COMPONENTS}")
+    endif ()
+
     set(EXCLUDE_COMPONENTS "Simulator")
 
     # panic_info_t is architecture-independent (esp_private/panic_internal.h) so this wrap applies

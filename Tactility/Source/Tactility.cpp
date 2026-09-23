@@ -211,6 +211,9 @@ namespace app {
 
 // endregion
 
+// Optional, provided by an out-of-tree component (see registerInternalApps()); null when absent.
+extern "C" __attribute__((weak)) void tt_fork_register_apps(void);
+
 // List of all apps excluding Boot app (as Boot app calls this function indirectly)
 static void registerInternalApps() {
     LOG_I(TAG, "Registering internal apps");
@@ -298,6 +301,15 @@ static void registerInternalApps() {
     app_manager_add(&app::btmanage::manifest);
     app_manager_add(&app::btpeersettings::manifest);
 #endif
+
+    // Fork extension point: an out-of-tree ESP-IDF component (built in via TT_EXTRA_COMPONENT_DIRS /
+    // TT_EXTRA_COMPONENTS, see the root CMakeLists.txt) can define tt_fork_register_apps() to
+    // register its own apps with app_manager_add(). Weak, so a normal build without such a
+    // component links fine and simply skips this. Used by N0D3 DeskOS "lilygo-thmi-v2".
+    if (tt_fork_register_apps != nullptr) {
+        LOG_I(TAG, "Registering fork apps");
+        tt_fork_register_apps();
+    }
 }
 
 // Registers every mounted filesystem's app install directory with app-module (see
